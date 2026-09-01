@@ -1,0 +1,37 @@
+# Render blueprint for the Bourse Stage-2 ingestion worker.
+# The worker is an always-on background service (no HTTP port) that runs the
+# discover/sync/derive/fresh loops feeding Neon — see worker/README.md and
+# ARCHITECTURE.md (Diagram B, lane ④). It reuses worker/Dockerfile, whose build
+# context is the repo ROOT (it imports the shared modules from ../src/lib), so
+# dockerContext is "." and dockerfilePath points into worker/.
+#
+# NOTE: Background Workers are a paid Render service type. To deploy:
+#   1. Render Dashboard → New → Blueprint → connect this repo.
+#   2. When prompted, paste the secret env vars marked `sync: false` below
+#      (the Neon connection string). Everything else has a safe default.
+services:
+  - type: worker
+    name: bourse-worker
+    runtime: docker
+    dockerfilePath: ./worker/Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    envVars:
+      # Neon connection. The worker prefers the DIRECT (unpooled) URL for its
+      # long-lived pool; set at least one. Marked secret — paste in the dashboard.
+      - key: DATABASE_URL_UNPOOLED
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      # Hyperliquid equity dex + WS endpoint. Defaults live in worker/src/config.ts;
+      # pinned here so the running service is self-documenting.
+      - key: BOURSE_DEX
+        value: xyz
+      - key: HL_WS_URL
+        value: wss://api.hyperliquid.xyz/ws
+      # Pace the budget-dominating sync loop. Defaults are conservative; override
+      # here without a code change if the 1200 wt/min budget allows more.
+      - key: SYNC_MAX_PAGES
+        value: "6"
