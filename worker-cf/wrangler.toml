@@ -1,0 +1,41 @@
+# Bourse Stage-2 worker — Cloudflare Durable Object edition.
+#
+# Same four loops as ../worker (discover/sync/derive/fresh), but hosted as a SINGLE
+# Durable Object instead of an always-on VM. The DO is the Cloudflare-native home for
+# this workload because it matches every invariant: a singleton instance = one isolate
+# = one in-memory hl token bucket (can't blow Hyperliquid's 1200 wt/min); it holds one
+# outbound WebSocket to the trades feed; and DO Alarms drive the periodic loops. A
+# once-a-minute Cron Trigger pings the DO so it's re-woken if Cloudflare ever evicts it.
+#
+# Deploy: see DEPLOY-CLOUDFLARE.md. DATABASE_URL is a SECRET (wrangler secret put),
+# never committed here.
+
+name = "bourse-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# The singleton ingestor. SQLite-backed class (new_sqlite_classes) so it works on the
+# broadest set of plans; we only use alarms + in-memory state, not KV storage.
+[[durable_objects.bindings]]
+name = "INGESTOR"
+class_name = "Ingestor"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ingestor"]
+
+# Keepalive: wake the singleton DO every minute. The DO self-drives via alarms once
+# awake; this only matters if it was evicted (reconnects WS + re-arms the alarm).
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+BOURSE_DEX = "xyz"
+# Loop cadences (ms) — override here or leave the in-code defaults.
+# SYNC_INTERVAL_MS = "30000"
+# SYNC_BATCH_SIZE  = "15"
+# SYNC_MAX_PAGES   = "6"
+# DERIVE_INTERVAL_MS = "60000"
+# FRESH_INTERVAL_MS  = "300000"
+# BACKFILL_DAYS      = "60"

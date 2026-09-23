@@ -1,0 +1,41 @@
+# DigitalOcean App Platform spec for the Bourse Stage-2 ingestion worker.
+# Deploy with: doctl apps create --spec .do/app.yaml   (or the dashboard's
+# "create from spec" import — see worker/DEPLOY-DIGITALOCEAN.md for the full
+# walkthrough, including the required env vars this file deliberately omits
+# values for).
+#
+# This is a background worker (no HTTP port) — discover/sync/derive/fresh,
+# same four loops as railway.json/render.yaml, reusing worker/Dockerfile
+# unchanged. This repo (Bourse-Backend) is self-contained — the shared
+# hl/symbols/wallets-metrics modules the worker imports are vendored under
+# src/lib here, so source_dir is just the repo root, no build-context
+# workaround needed.
+name: bourse-worker
+region: nyc
+workers:
+  - name: bourse-worker
+    github:
+      repo: 0xArchitect/Bourse-Backend
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: worker/Dockerfile
+    source_dir: /
+    # All four loops share one egress IP + one Hyperliquid rate-budget token
+    # bucket (see worker/README.md). A second instance = a second IP = a
+    # doubled upstream rate that can blow the 1200 wt/min budget. Never raise
+    # this, and don't add an autoscaling block.
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    envs:
+      - key: DATABASE_URL_UNPOOLED
+        scope: RUN_TIME
+        type: SECRET
+      - key: SYNC_MAX_PAGES
+        scope: RUN_TIME
+        value: "6"
+      - key: SYNC_BATCH_SIZE
+        scope: RUN_TIME
+        value: "15"
+      - key: BOURSE_DEX
+        scope: RUN_TIME
+        value: xyz
