@@ -1,0 +1,17 @@
+# Keep the worker's Docker/Railway build context lean and secret-free. The worker
+# Dockerfile only needs src/lib + worker/ source; everything below is rebuilt in-image
+# or must never ship.
+node_modules
+worker/node_modules
+.next
+out
+build
+.git
+.vercel
+.agents
+.bourse-shots
+# Secrets are set in the Railway dashboard, never baked into the image.
+.env
+.env.*
+!.env.example
+*.log
