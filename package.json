@@ -1,0 +1,16 @@
+{
+  "name": "bourse-backend-shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tooling for src/lib — the deep modules shared (vendored) by worker/ and worker-cf/. No runtime lives at this level; see worker/README.md and worker-cf/DEPLOY-CLOUDFLARE.md for the two deployable services.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.4",
+    "typescript": "5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

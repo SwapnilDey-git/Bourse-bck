@@ -4,15 +4,20 @@
 // so this is cheap even over the whole table.
 
 import { config } from "../config";
-import { FRESH_MAX_AGE_DAYS } from "../core";
-import { refreshFreshFlags } from "../db";
+import { runFreshTick, FRESH_MAX_AGE_DAYS } from "../core";
+import { db } from "../db";
+import { reportTick } from "../health";
 
 async function tick() {
+  let tickError: string | undefined;
   try {
-    const changed = await refreshFreshFlags(FRESH_MAX_AGE_DAYS);
+    const changed = await runFreshTick(db, FRESH_MAX_AGE_DAYS);
     if (changed) console.log(`[fresh] flipped is_fresh on ${changed} wallets`);
   } catch (err) {
-    console.error("[fresh] failed:", (err as Error).message);
+    tickError = (err as Error).message;
+    console.error("[fresh] failed:", tickError);
+  } finally {
+    reportTick("fresh", config.freshIntervalMs, tickError);
   }
 }
 

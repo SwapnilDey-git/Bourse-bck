@@ -7,23 +7,17 @@
 //
 // makeDb(url) is a factory so the Durable Object can construct it once from the
 // DATABASE_URL binding at runtime (Workers has no process.env at module load).
+// Implements ../../src/lib/wallets/ingest.ts's IngestDb interface — see that file
+// for why each method exists.
 
 import { neon } from "@neondatabase/serverless";
+import { nextAttemptDelay, type IngestDb, type FillInsert, type SyncTarget } from "../../src/lib/wallets/ingest";
 
-const DAY_MS = 86_400_000;
 const FILL_COLS = 14;
 const FILL_CHUNK = 500; // 14×500 = 7000 params, well under Postgres's 65535 bind cap
 const iso = (ms: number) => new Date(ms).toISOString();
 
-export type SyncTarget = { address: string; last_indexed_at: string | null };
-export type FillInsert = {
-  tid: number; address: string; coin: string; ticker: string;
-  side: string; dir: string; leveraged: boolean; sz: number; px: number;
-  notional: number; closedPnl: number; fee: number; isClose: boolean; time: number;
-};
-export type DeriveFill = { time: number; closed_pnl: number; is_close: boolean; notional: number };
-
-export function makeDb(url: string) {
+export function makeDb(url: string): IngestDb {
   const sql = neon(url);
   // The neon HTTP driver has no `.query` method — call `sql` directly as an ordinary
   // function: sql(text, params). Default (fullResults:false) returns the rows array.
@@ -33,10 +27,6 @@ export function makeDb(url: string) {
   };
 
   return {
-    async ping(): Promise<void> {
-      await rows("SELECT 1");
-    },
-
     // ── discover ──────────────────────────────────────────────────────────
     async upsertWallets(addresses: string[]): Promise<number> {
       if (!addresses.length) return 0;
@@ -50,11 +40,22 @@ export function makeDb(url: string) {
     },
 
     // ── sync ──────────────────────────────────────────────────────────────
-    syncBatch(limit: number): Promise<SyncTarget[]> {
+    // Atomically claim + lease due wallets — see worker/src/db.ts's claimSyncBatch
+    // for the multi-instance-safety rationale (identical SQL, HTTP transport).
+    async claimSyncBatch(limit: number, leaseMs: number): Promise<SyncTarget[]> {
       return rows<SyncTarget>(
-        `SELECT address, last_indexed_at FROM wallet
-         ORDER BY (tier='hot') DESC, last_indexed_at ASC NULLS FIRST LIMIT $1`,
-        [limit],
+        `WITH due AS (
+           SELECT address FROM wallet
+           WHERE (claimed_until IS NULL OR claimed_until <= now())
+             AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+           ORDER BY (tier='hot') DESC, last_indexed_at ASC NULLS FIRST
+           LIMIT $1
+           FOR UPDATE SKIP LOCKED
+         )
+         UPDATE wallet SET claimed_until = now() + ($2 || ' milliseconds')::interval
+         FROM due WHERE wallet.address = due.address
+         RETURNING wallet.address, wallet.last_indexed_at`,
+        [limit, leaseMs],
       );
     },
 
@@ -80,25 +81,44 @@ export function makeDb(url: string) {
       return inserted;
     },
 
-    async markIndexed(address: string, watermark: number, earliestFill: number | null): Promise<void> {
+    async recordSyncSuccess(address: string, watermark: number, earliestFill: number | null): Promise<void> {
       await rows(
         `UPDATE wallet SET last_indexed_at = $2,
-           first_hip3_trade_at = LEAST(COALESCE(first_hip3_trade_at, $3), $3)
+           first_hip3_trade_at = LEAST(COALESCE(first_hip3_trade_at, $3), $3),
+           fail_count = 0, last_error = NULL, next_attempt_at = NULL, claimed_until = NULL
          WHERE address = $1`,
         [address, iso(watermark), earliestFill ? iso(earliestFill) : null],
       );
     },
 
+    async recordSyncFailure(address: string, message: string): Promise<void> {
+      const r = await rows<{ fail_count: number }>(
+        `UPDATE wallet SET fail_count = fail_count + 1, last_error = $2, claimed_until = NULL
+         WHERE address = $1 RETURNING fail_count`,
+        [address, message.slice(0, 500)],
+      );
+      const failCount = r[0]?.fail_count ?? 1;
+      await rows(
+        `UPDATE wallet SET next_attempt_at = $2 WHERE address = $1`,
+        [address, iso(Date.now() + nextAttemptDelay(failCount))],
+      );
+    },
+
     // ── derive ────────────────────────────────────────────────────────────
+    // Least-recently-derived first (see worker/src/db.ts's metricsCandidates
+    // for why the old unordered DISTINCT could starve wallets past `limit`).
     metricsCandidates(sinceMs: number, limit: number): Promise<{ address: string }[]> {
       return rows<{ address: string }>(
-        `SELECT DISTINCT address FROM fill WHERE time >= $1 LIMIT $2`,
+        `SELECT f.address FROM (SELECT DISTINCT address FROM fill WHERE time >= $1) f
+         LEFT JOIN wallet_metrics wm ON wm.address = f.address
+         ORDER BY wm.computed_at ASC NULLS FIRST
+         LIMIT $2`,
         [iso(sinceMs), limit],
       );
     },
 
-    fillsForDerive(address: string, sinceMs: number): Promise<DeriveFill[]> {
-      return rows<DeriveFill>(
+    fillsForDerive(address: string, sinceMs: number) {
+      return rows<{ time: number; closed_pnl: number; is_close: boolean; notional: number }>(
         `SELECT extract(epoch FROM time)*1000 AS time, closed_pnl, is_close, notional
          FROM fill WHERE address = $1 AND time >= $2`,
         [address, iso(sinceMs)],
@@ -143,5 +163,8 @@ export function makeDb(url: string) {
   };
 }
 
-export type Db = ReturnType<typeof makeDb>;
-export const sinceWindow = (days: number) => Date.now() - days * DAY_MS;
+// A ping used only at DO init to fail fast on a missing/unreachable database.
+export async function ping(url: string): Promise<void> {
+  const sql = neon(url);
+  await sql("SELECT 1");
+}

@@ -12,6 +12,7 @@ import { startDiscover, stopDiscover } from "./loops/discover";
 import { startSync, stopSync } from "./loops/sync";
 import { startDerive, stopDerive } from "./loops/derive";
 import { startFresh, stopFresh } from "./loops/fresh";
+import { startHeartbeatLog, stopHeartbeatLog, startHealthServer, stopHealthServer } from "./health";
 
 async function main() {
   if (!config.databaseUrl) {
@@ -32,11 +33,15 @@ async function main() {
   startSync();
   startDerive();
   startFresh();
+  startHeartbeatLog();
+  if (config.healthPort) startHealthServer(config.healthPort);
   console.log("[worker] all four loops running");
 }
 
 async function shutdown(sig: string) {
   console.log(`[worker] ${sig} — draining`);
+  stopHealthServer();
+  stopHeartbeatLog();
   stopFresh();
   stopDerive();
   stopSync();

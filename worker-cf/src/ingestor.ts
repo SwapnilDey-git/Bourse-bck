@@ -1,9 +1,12 @@
 // The Ingestor Durable Object — the four ingestion loops as a single Cloudflare-hosted
-// isolate. It reuses the SAME deep modules the Railway worker and the Next app use
-// (../../src/lib/{hl,symbols,wallets/metrics}) — all fetch-based/pure, so they run
-// unchanged in the Workers runtime. Only the orchestration shell differs from
-// ../worker: a persistent OUTBOUND WebSocket for discovery, and DO Alarms in place of
-// setInterval for the periodic loops.
+// isolate. It reuses the SAME orchestration the Railway worker uses
+// (../../src/lib/wallets/ingest.ts, which itself sits on ../../src/lib/{hl,symbols}) —
+// all fetch-based/pure, so it runs unchanged in the Workers runtime. Only the
+// orchestration SHELL differs from ../worker: a persistent OUTBOUND WebSocket for
+// discovery, and DO Alarms in place of setInterval for the periodic loops. The two
+// runtimes used to carry byte-for-byte duplicate loop bodies here; they now both call
+// into src/lib/wallets/ingest.ts so a change (e.g. the sync retry/backoff policy)
+// can't drift between them.
 //
 // Why a singleton DO: index.ts always addresses it by the fixed name "singleton", so
 // there is exactly one instance = one isolate = one in-memory hl token bucket. That is
@@ -12,8 +15,9 @@
 
 import * as hl from "../../src/lib/hl";
 import { classify } from "../../src/lib/symbols";
-import { deriveMetrics, ageDaysFrom, WINDOW_DAYS, FRESH_MAX_AGE_DAYS } from "../../src/lib/wallets/metrics";
-import { makeDb, sinceWindow, type Db, type FillInsert, type SyncTarget } from "./db";
+import { FRESH_MAX_AGE_DAYS, WINDOW_DAYS } from "../../src/lib/wallets/metrics";
+import { runSyncTick, runDeriveTick, runFreshTick, sinceWindow, type IngestDb } from "../../src/lib/wallets/ingest";
+import { makeDb, ping } from "./db";
 
 export interface Env {
   INGESTOR: DurableObjectNamespace;
@@ -23,7 +27,10 @@ export interface Env {
   SYNC_INTERVAL_MS?: string;
   SYNC_BATCH_SIZE?: string;
   SYNC_MAX_PAGES?: string;
+  SYNC_CONCURRENCY?: string;
+  SYNC_LEASE_MS?: string;
   DERIVE_INTERVAL_MS?: string;
+  DERIVE_CONCURRENCY?: string;
   FRESH_INTERVAL_MS?: string;
   BACKFILL_DAYS?: string;
 }
@@ -42,14 +49,19 @@ type Loop = "flush" | "discover" | "sync" | "derive" | "fresh";
 export class Ingestor {
   private state: DurableObjectState;
   private env: Env;
-  private db: Db;
+  private db: IngestDb;
   private dex: string;
-  private cfg: { syncMs: number; syncBatch: number; syncPages: number; deriveMs: number; freshMs: number; backfillDays: number };
+  private cfg: {
+    syncMs: number; syncBatch: number; syncPages: number; syncConcurrency: number; syncLeaseMs: number;
+    deriveMs: number; deriveConcurrency: number; freshMs: number; backfillDays: number;
+  };
 
   private coins: string[] = [];
   private ws: WebSocket | null = null;
   private buffer = new Set<string>();
   private ready = false;
+  private lastMessageAt = 0;
+  private malformedCount = 0;
 
   private loops: Record<Loop, { every: number; next: number }>;
 
@@ -62,7 +74,10 @@ export class Ingestor {
       syncMs: numEnv(env.SYNC_INTERVAL_MS, 30_000),
       syncBatch: numEnv(env.SYNC_BATCH_SIZE, 15),
       syncPages: numEnv(env.SYNC_MAX_PAGES, 6),
+      syncConcurrency: numEnv(env.SYNC_CONCURRENCY, 4),
+      syncLeaseMs: numEnv(env.SYNC_LEASE_MS, 120_000),
       deriveMs: numEnv(env.DERIVE_INTERVAL_MS, 60_000),
+      deriveConcurrency: numEnv(env.DERIVE_CONCURRENCY, 8),
       freshMs: numEnv(env.FRESH_INTERVAL_MS, 300_000),
       backfillDays: numEnv(env.BACKFILL_DAYS, 60),
     };
@@ -78,10 +93,17 @@ export class Ingestor {
   // Any hit (cron ping or manual) ensures the DO is initialized and an alarm is armed.
   async fetch(_req: Request): Promise<Response> {
     await this.ensureStarted();
-    const counts = await this.snapshot().catch(() => null);
-    return new Response(JSON.stringify({ ok: true, coins: this.coins.length, buffered: this.buffer.size, counts }), {
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        coins: this.coins.length,
+        buffered: this.buffer.size,
+        malformedMessages: this.malformedCount,
+        wsConnected: !!this.ws,
+        lastMessageAgoMs: this.lastMessageAt ? Date.now() - this.lastMessageAt : null,
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
   }
 
   private async ensureStarted() {
@@ -96,7 +118,7 @@ export class Ingestor {
   }
 
   private async init() {
-    await this.db.ping();
+    await ping(this.env.DATABASE_URL);
     this.coins = await this.equityCoins();
     console.log(`[cf] init · dex=${this.dex} · ${this.coins.length} equity coins`);
   }
@@ -118,7 +140,15 @@ export class Ingestor {
     if (!ws) throw new Error(`WS upgrade failed (status ${resp.status})`);
     ws.accept();
     ws.addEventListener("message", (e: MessageEvent) => this.onMessage(e.data));
-    ws.addEventListener("close", () => { this.ws = null; });
+    ws.addEventListener("close", () => {
+      if (this.lastMessageAt) {
+        const gapMs = Date.now() - this.lastMessageAt;
+        if (gapMs > 5_000) {
+          console.warn(`[cf] WS closed after a ${(gapMs / 1000).toFixed(1)}s-old last message — reconnect will leave a discovery gap`);
+        }
+      }
+      this.ws = null;
+    });
     ws.addEventListener("error", () => { this.ws = null; });
     for (const coin of this.coins) {
       ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "trades", coin } }));
@@ -128,8 +158,15 @@ export class Ingestor {
   }
 
   private onMessage(data: string | ArrayBuffer) {
+    this.lastMessageAt = Date.now();
     let msg: { channel?: string; data?: Trade | Trade[] };
-    try { msg = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data)); } catch { return; }
+    try {
+      msg = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data));
+    } catch (err) {
+      this.malformedCount++;
+      console.warn(`[cf] malformed WS message #${this.malformedCount}: ${(err as Error).message}`);
+      return;
+    }
     if (msg.channel !== "trades" || !msg.data) return;
     const trades = Array.isArray(msg.data) ? msg.data : [msg.data];
     for (const t of trades) for (const u of t.users ?? []) if (u) this.buffer.add(u.toLowerCase());
@@ -161,7 +198,7 @@ export class Ingestor {
     if (loop === "fresh") return this.fresh();
   }
 
-  // ── loops (same logic as ../worker/src/loops/*) ──────────────────────────
+  // ── loops — thin wrappers over the shared src/lib/wallets/ingest.ts ─────
   private async flush() {
     if (!this.buffer.size) return;
     const batch = [...this.buffer];
@@ -180,69 +217,35 @@ export class Ingestor {
     }
   }
 
-  private watermarkOf(t: SyncTarget): number {
-    return t.last_indexed_at ? Date.parse(t.last_indexed_at) : sinceWindow(this.cfg.backfillDays);
-  }
-
   private async sync() {
-    const batch = await this.db.syncBatch(this.cfg.syncBatch);
-    let total = 0;
-    for (const t of batch) {
-      try {
-        const start = this.watermarkOf(t);
-        const { fills } = await hl.userFillsPaged(t.address, start, { maxPages: this.cfg.syncPages });
-        const rows: FillInsert[] = [];
-        let earliest: number | null = null;
-        for (const f of fills) {
-          const info = classify(f.coin);
-          if (!info) continue;
-          const sz = parseFloat(f.sz), px = parseFloat(f.px);
-          rows.push({
-            tid: f.tid, address: t.address, coin: f.coin, ticker: info.ticker,
-            side: f.side, dir: f.dir, leveraged: true, sz, px, notional: sz * px,
-            closedPnl: parseFloat(f.closedPnl || "0"), fee: parseFloat(f.fee || "0"),
-            isClose: /^close/i.test(f.dir), time: f.time,
-          });
-          if (earliest === null || f.time < earliest) earliest = f.time;
-        }
-        total += await this.db.insertFills(rows);
-        const newest = fills.length ? Math.max(...fills.map((f) => f.time)) : Date.now();
-        await this.db.markIndexed(t.address, newest, earliest);
-      } catch (e) {
-        console.error(`[cf] sync ${t.address}:`, (e as Error).message);
-      }
-    }
-    if (total) console.log(`[cf] sync +${total} fills / ${batch.length} wallets`);
+    const { totalInserted, walletsProcessed } = await runSyncTick(
+      this.db,
+      {
+        dex: this.dex,
+        maxPages: this.cfg.syncPages,
+        backfillDays: this.cfg.backfillDays,
+        batchSize: this.cfg.syncBatch,
+        concurrency: this.cfg.syncConcurrency,
+        leaseMs: this.cfg.syncLeaseMs,
+      },
+      (address, result) => {
+        if ("error" in result) console.error(`[cf] sync ${address}:`, result.error);
+      },
+    );
+    if (totalInserted) console.log(`[cf] sync +${totalInserted} fills / ${walletsProcessed} wallets`);
   }
 
   private async derive() {
-    const now = Date.now();
-    const since = sinceWindow(WINDOW_DAYS);
-    const candidates = await this.db.metricsCandidates(since, 200);
-    for (const { address } of candidates) {
-      try {
-        const raw = await this.db.fillsForDerive(address, since);
-        const m = deriveMetrics(
-          raw.map((f) => ({ time: Number(f.time), closedPnl: Number(f.closed_pnl), isClose: f.is_close, notional: Number(f.notional) })),
-          now,
-        );
-        const firstMs = await this.db.firstTradeMs(address);
-        await this.db.upsertMetrics({ address, ...m, ageDays: ageDaysFrom(firstMs, now) });
-      } catch (e) {
-        console.error(`[cf] derive ${address}:`, (e as Error).message);
-      }
-    }
-    if (candidates.length) console.log(`[cf] derive ${candidates.length} wallets`);
+    const { processed } = await runDeriveTick(
+      this.db,
+      { sinceMs: sinceWindow(WINDOW_DAYS), batchSize: 200, concurrency: this.cfg.deriveConcurrency, now: Date.now() },
+      (address, message) => console.error(`[cf] derive ${address}:`, message),
+    );
+    if (processed) console.log(`[cf] derive ${processed} wallets`);
   }
 
   private async fresh() {
-    const changed = await this.db.refreshFreshFlags(FRESH_MAX_AGE_DAYS);
+    const changed = await runFreshTick(this.db, FRESH_MAX_AGE_DAYS);
     if (changed) console.log(`[cf] fresh flipped ${changed}`);
-  }
-
-  private async snapshot() {
-    // best-effort health counts for the /ping response
-    const [w] = await this.db.syncBatch(1);
-    return { hasWallets: !!w };
   }
 }

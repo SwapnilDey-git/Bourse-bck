@@ -65,7 +65,53 @@ instance/replica count at **1** — see "one egress IP" above.
 ## Config
 
 Every knob is an env var read in `src/config.ts` — `SYNC_INTERVAL_MS`, `SYNC_BATCH_SIZE`,
-`DERIVE_INTERVAL_MS`, `BACKFILL_DAYS`, etc. Defaults are conservative and budget-safe.
+`SYNC_CONCURRENCY`, `SYNC_LEASE_MS`, `DERIVE_INTERVAL_MS`, `DERIVE_CONCURRENCY`, `BACKFILL_DAYS`,
+`HEALTH_PORT`, etc. Defaults are conservative and budget-safe.
+
+## Schema migrations
+
+`db/schema.sql` (idempotent — `CREATE TABLE IF NOT EXISTS` throughout) is still applied by hand
+once per fresh database. Anything **after** that baseline lives in `../db/migrations/*.sql` and is
+applied by:
+
+```bash
+cd worker && DATABASE_URL="postgres://…" npm run migrate
+```
+
+Each file runs once, in filename order, inside its own transaction, tracked in a
+`schema_migrations` table — safe to re-run (already-applied files are skipped). Add new schema
+changes as a new numbered file there rather than editing `schema.sql` directly.
+
+## Multi-instance safety (data-level only) — read before raising instance/replica count
+
+`claimSyncBatch` (`src/db.ts`) atomically leases each wallet it hands out (`FOR UPDATE SKIP
+LOCKED` + a `claimed_until` column, migration 0003), so two worker processes hitting the same
+database can no longer double-process the same wallet or clobber each other's watermark. A wallet
+that keeps failing also backs off (`fail_count`/`next_attempt_at`, exponential + jitter) instead of
+sitting at the front of the queue forever.
+
+**This does not make it safe to run more than one instance.** The Hyperliquid rate-budget token
+bucket (`src/lib/hl`'s `spend()`) is in-process memory — a second instance is a second bucket,
+doubling real request volume against the shared 1200 wt/min ceiling regardless of DB-level
+locking. The "exactly one instance" rule above (and in every deploy config) still applies; this
+fix only means a brief overlap during a deploy's old/new instance handoff, or a future move to a
+shared distributed rate limiter, wouldn't corrupt data — it doesn't unlock horizontal scaling by
+itself.
+
+## Health / observability
+
+- A structured `[health] {...}` JSON line is logged every 60s (`src/health.ts`) with each loop's
+  last-tick time and last error — greppable/shippable to any log-based monitor without a new
+  integration.
+- Set `HEALTH_PORT` to also serve `GET /health` (200 if every loop has ticked within 3x its own
+  interval, 503 otherwise). Off by default — every current deploy target runs this as a headless
+  background worker with no HTTP port; only set it if you're wiring a platform health check.
+
+## Tests
+
+Pure orchestration logic (retry/backoff, ticker-classification gating, the sync/derive tick
+against a fake DB, `deriveMetrics` math) is unit-tested from the repo root, not from here — see
+the root `README.md`.
 
 ## Diagnostics (no database needed — pure Hyperliquid reads)
 

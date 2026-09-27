@@ -11,3 +11,8 @@ export {
   deriveMetrics, ageDaysFrom, WINDOW_DAYS, FRESH_MAX_AGE_DAYS,
   type MetricFill,
 } from "../../src/lib/wallets/metrics";
+export {
+  runSyncTick, runDeriveTick, runFreshTick, nextAttemptDelay, classifyForIngestion, sinceWindow,
+  type IngestDb, type SyncTarget, type FillInsert, type DeriveFill, type SyncOpts,
+  type SyncWalletOutcome,
+} from "../../src/lib/wallets/ingest";

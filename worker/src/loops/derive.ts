@@ -1,49 +1,39 @@
 // Loop 3 · Derive — recompute wallet_metrics from `fill` over the 60-day window.
-// Pure math lives in the shared metrics module (deriveMetrics), so the numbers the
-// worker persists are byte-identical to what the read layer would compute. This is
-// the "precomputed, never recomputed per view" half of the depth-cap survival split.
+// Pure math lives in the shared metrics module (deriveMetrics), so the numbers
+// the worker persists are byte-identical to what the read layer would compute.
+// Thin wrapper around the shared runDeriveTick (src/lib/wallets/ingest.ts, via
+// ../core), which also fixes the candidate-selection starvation: candidates are
+// now ordered least-recently-derived first instead of an unordered DISTINCT.
 
 import { config } from "../config";
-import { deriveMetrics, ageDaysFrom, WINDOW_DAYS } from "../core";
-import {
-  fillsForDerive, metricsCandidates, upsertMetrics, sinceWindow, pool,
-} from "../db";
+import { runDeriveTick, sinceWindow, WINDOW_DAYS } from "../core";
+import { db } from "../db";
+import { reportTick } from "../health";
 
 let running = false;
 
 async function tick() {
   if (running) return;
   running = true;
-  const now = Date.now();
-  const since = sinceWindow(WINDOW_DAYS);
+  let tickError: string | undefined;
   try {
-    const candidates = await metricsCandidates(since, config.deriveBatchSize);
-    for (const { address } of candidates) {
-      try {
-        const raw = await fillsForDerive(address, since);
-        const m = deriveMetrics(
-          raw.map((f) => ({
-            time: Number(f.time),
-            closedPnl: Number(f.closed_pnl),
-            isClose: f.is_close,
-            notional: Number(f.notional),
-          })),
-          now,
-        );
-        // Age basis is the wallet's earliest-ever HIP-3 trade, not window-clipped.
-        const ageRow = await pool.query(
-          `SELECT extract(epoch FROM first_hip3_trade_at)*1000 AS t FROM wallet WHERE address=$1`,
-          [address],
-        );
-        const firstMs = ageRow.rows[0]?.t ? Number(ageRow.rows[0].t) : null;
-        await upsertMetrics({ address, ...m, ageDays: ageDaysFrom(firstMs, now) });
-      } catch (err) {
-        console.error(`[derive] ${address} failed:`, (err as Error).message);
-      }
-    }
-    if (candidates.length) console.log(`[derive] recomputed ${candidates.length} wallets`);
+    const { processed } = await runDeriveTick(
+      db,
+      {
+        sinceMs: sinceWindow(WINDOW_DAYS),
+        batchSize: config.deriveBatchSize,
+        concurrency: config.deriveConcurrency,
+        now: Date.now(),
+      },
+      (address, message) => console.error(`[derive] ${address} failed:`, message),
+    );
+    if (processed) console.log(`[derive] recomputed ${processed} wallets`);
+  } catch (err) {
+    tickError = (err as Error).message;
+    console.error("[derive] tick failed:", tickError);
   } finally {
     running = false;
+    reportTick("derive", config.deriveIntervalMs, tickError);
   }
 }
 

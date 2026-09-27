@@ -9,7 +9,8 @@
     "start": "tsx src/index.ts",
     "dryrun": "tsx src/dryrun.ts",
     "typecheck": "tsc --noEmit",
-    "db:apply": "psql \"$DATABASE_URL\" -f ../db/schema.sql"
+    "db:apply": "psql \"$DATABASE_URL\" -f ../db/schema.sql",
+    "migrate": "tsx src/migrate.ts"
   },
   "dependencies": {
     "pg": "^8.13.1",

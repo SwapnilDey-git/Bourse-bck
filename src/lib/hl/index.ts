@@ -34,6 +34,27 @@ async function spend(weight: number): Promise<void> {
   spent += weight;
 }
 
+// Thrown for a non-2xx HTTP response, carrying the status so callers (and the
+// retry policy below) can tell "rate-limited/transient" from "our request was
+// wrong" apart — a network-level throw (DNS, timeout, connection reset) is a
+// plain Error and always retried.
+export class HlHttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = "HlHttpError";
+  }
+}
+
+// Only retry what retrying can plausibly fix: a transient network failure, a
+// rate limit (429), or the server's own 5xx. A 4xx other than 429 means our
+// request was malformed or unauthorized — retrying it three times just burns
+// weight budget to reproduce the same error (review finding: "the retry logic
+// treats every failure the same way").
+function isRetryable(err: unknown): boolean {
+  if (err instanceof HlHttpError) return err.status === 429 || err.status >= 500;
+  return true;
+}
+
 async function postInfo<T>(body: object, weight: number, attempt = 0): Promise<T> {
   await spend(weight);
   try {
@@ -44,11 +65,13 @@ async function postInfo<T>(body: object, weight: number, attempt = 0): Promise<T
     };
     if (!IS_WORKERD) (init as { cache?: string }).cache = "no-store";
     const res = await fetch(INFO_URL, init);
-    if (!res.ok) throw new Error(`HL ${res.status}`);
+    if (!res.ok) throw new HlHttpError(res.status, `HL ${res.status}`);
     return (await res.json()) as T;
   } catch (err) {
-    if (attempt < 3) {
-      await new Promise((r) => setTimeout(r, 250 * 2 ** attempt)); // 250 / 500 / 1000ms
+    if (attempt < 3 && isRetryable(err)) {
+      const backoff = 250 * 2 ** attempt; // 250 / 500 / 1000ms
+      const jittered = backoff * (0.5 + Math.random() * 0.5);
+      await new Promise((r) => setTimeout(r, jittered));
       return postInfo<T>(body, weight, attempt + 1);
     }
     throw err;
