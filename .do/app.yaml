@@ -15,7 +15,7 @@ region: nyc
 workers:
   - name: bourse-worker
     github:
-      repo: 0xArchitect/Bourse-Backend
+      repo: SwapnilDey-git/Bourse-bck
       branch: main
       deploy_on_push: true
     dockerfile_path: worker/Dockerfile
