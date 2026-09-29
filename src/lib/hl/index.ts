@@ -210,6 +210,8 @@ export type ClearinghouseState = {
 // clearinghouseState — a wallet's CURRENT open positions, live. Cheap (wt 2), so
 // profile pages call it on the request path behind a short cache; historical
 // trades/metrics come from Postgres instead.
-export async function clearinghouseState(user: string): Promise<ClearinghouseState> {
-  return postInfo<ClearinghouseState>({ type: "clearinghouseState", user }, 2);
+export async function clearinghouseState(user: string, dex?: string): Promise<ClearinghouseState> {
+  const req: Record<string, unknown> = { type: "clearinghouseState", user };
+  if (dex) req.dex = dex;
+  return postInfo<ClearinghouseState>(req, 2);
 }
