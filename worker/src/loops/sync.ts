@@ -23,6 +23,7 @@ async function tick() {
         dex: config.dex,
         maxPages: config.syncMaxPagesPerWallet,
         backfillDays: config.backfillDays,
+        keepRaw: config.rawFillsPerWallet,
         batchSize: config.syncBatchSize,
         concurrency: config.syncConcurrency,
         leaseMs: config.syncLeaseMs,

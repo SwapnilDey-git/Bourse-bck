@@ -12,7 +12,10 @@ export {
   type MetricFill,
 } from "../../src/lib/wallets/metrics";
 export {
-  runSyncTick, runDeriveTick, runFreshTick, nextAttemptDelay, classifyForIngestion, sinceWindow,
-  type IngestDb, type SyncTarget, type FillInsert, type DeriveFill, type SyncOpts,
+  runSyncTick, runDeriveTick, runFreshTick, runRetainTick, nextAttemptDelay, classifyForIngestion, sinceWindow,
+  type IngestDb, type SyncTarget, type FillInsert, type IngestBatch, type DailyAgg, type SyncOpts,
   type SyncWalletOutcome,
 } from "../../src/lib/wallets/ingest";
+export {
+  INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+} from "../../src/lib/wallets/sql";

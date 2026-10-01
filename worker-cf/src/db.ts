@@ -11,10 +11,11 @@
 // for why each method exists.
 
 import { neon } from "@neondatabase/serverless";
-import { nextAttemptDelay, type IngestDb, type FillInsert, type SyncTarget } from "../../src/lib/wallets/ingest";
+import { nextAttemptDelay, type IngestDb, type IngestBatch, type SyncTarget } from "../../src/lib/wallets/ingest";
+import {
+  INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+} from "../../src/lib/wallets/sql";
 
-const FILL_COLS = 14;
-const FILL_CHUNK = 500; // 14×500 = 7000 params, well under Postgres's 65535 bind cap
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export function makeDb(url: string): IngestDb {
@@ -59,26 +60,13 @@ export function makeDb(url: string): IngestDb {
       );
     },
 
-    async insertFills(fills: FillInsert[]): Promise<number> {
-      if (!fills.length) return 0;
-      let inserted = 0;
-      for (let off = 0; off < fills.length; off += FILL_CHUNK) {
-        const chunk = fills.slice(off, off + FILL_CHUNK);
-        const values: unknown[] = [];
-        const tuples = chunk.map((r, i) => {
-          const b = i * FILL_COLS;
-          values.push(r.tid, r.address, r.coin, r.ticker, r.side, r.dir, r.leveraged,
-            r.sz, r.px, r.notional, r.closedPnl, r.fee, r.isClose, iso(r.time));
-          return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13},$${b + 14})`;
-        });
-        const res = await rows(
-          `INSERT INTO fill (tid,address,coin,ticker,side,dir,leveraged,sz,px,notional,closed_pnl,fee,is_close,time)
-           VALUES ${tuples.join(",")} ON CONFLICT (tid) DO NOTHING RETURNING tid`,
-          values,
-        );
-        inserted += res.length;
-      }
-      return inserted;
+    // Same single statement as worker/src/db.ts (src/lib/wallets/sql.ts).
+    async ingestFills(b: IngestBatch): Promise<number> {
+      const r = await rows<{ counted: number }>(INGEST_FILLS_SQL, [
+        JSON.stringify(b.tail), b.boundaryTids, JSON.stringify(b.daily), b.address, b.watermark,
+      ]);
+      await rows(TRIM_RAW_FILLS_SQL, [b.address, b.keepRaw]);
+      return Number(r[0]?.counted ?? 0);
     },
 
     async recordSyncSuccess(address: string, watermark: number, earliestFill: number | null): Promise<void> {
@@ -105,47 +93,8 @@ export function makeDb(url: string): IngestDb {
     },
 
     // ── derive ────────────────────────────────────────────────────────────
-    // Least-recently-derived first (see worker/src/db.ts's metricsCandidates
-    // for why the old unordered DISTINCT could starve wallets past `limit`).
-    metricsCandidates(sinceMs: number, limit: number): Promise<{ address: string }[]> {
-      return rows<{ address: string }>(
-        `SELECT f.address FROM (SELECT DISTINCT address FROM fill WHERE time >= $1) f
-         LEFT JOIN wallet_metrics wm ON wm.address = f.address
-         ORDER BY wm.computed_at ASC NULLS FIRST
-         LIMIT $2`,
-        [iso(sinceMs), limit],
-      );
-    },
-
-    fillsForDerive(address: string, sinceMs: number) {
-      return rows<{ time: number; closed_pnl: number; is_close: boolean; notional: number }>(
-        `SELECT extract(epoch FROM time)*1000 AS time, closed_pnl, is_close, notional
-         FROM fill WHERE address = $1 AND time >= $2`,
-        [address, iso(sinceMs)],
-      );
-    },
-
-    async firstTradeMs(address: string): Promise<number | null> {
-      const r = await rows<{ t: number | null }>(
-        `SELECT extract(epoch FROM first_hip3_trade_at)*1000 AS t FROM wallet WHERE address = $1`,
-        [address],
-      );
-      return r[0]?.t ? Number(r[0].t) : null;
-    },
-
-    async upsertMetrics(m: {
-      address: string; realizedPnl: number; winRate: number; tradeCount: number;
-      closedCount: number; activeDays: number; ageDays: number; qualifiesWinRate: boolean;
-    }): Promise<void> {
-      await rows(
-        `INSERT INTO wallet_metrics
-           (address, realized_pnl, win_rate, trade_count, closed_count, active_days, age_days, qualifies_winrate, computed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
-         ON CONFLICT (address) DO UPDATE SET
-           realized_pnl=$2, win_rate=$3, trade_count=$4, closed_count=$5,
-           active_days=$6, age_days=$7, qualifies_winrate=$8, computed_at=now()`,
-        [m.address, m.realizedPnl, m.winRate, m.tradeCount, m.closedCount, m.activeDays, m.ageDays, m.qualifiesWinRate],
-      );
+    async recomputeMetrics(windowDays: number): Promise<number> {
+      return (await rows(RECOMPUTE_METRICS_SQL, [windowDays])).length;
     },
 
     // ── fresh-flag ────────────────────────────────────────────────────────
@@ -160,8 +109,25 @@ export function makeDb(url: string): IngestDb {
       );
       return r.length;
     },
+
+    // ── retain (Neon storage) ────────────────────────────────────────────
+    // Batched so the FIRST run against a months-old backlog can't hold one
+    // long DELETE open on the HTTP driver — it works down PRUNE_BATCHES
+    // chunks per call and picks up where it left off on the next alarm tick.
+    async pruneOldFills(beforeMs: number): Promise<number> {
+      let total = (await rows(`${PRUNE_DAILY_SQL} RETURNING 1`, [beforeMs])).length;
+      for (let i = 0; i < PRUNE_BATCHES; i++) {
+        const r = await rows<{ tid: number }>(`${PRUNE_RAW_SQL} RETURNING tid`, [beforeMs, PRUNE_BATCH_SIZE]);
+        total += r.length;
+        if (r.length < PRUNE_BATCH_SIZE) break; // caught up
+      }
+      return total;
+    },
   };
 }
+
+const PRUNE_BATCH_SIZE = 5_000;
+const PRUNE_BATCHES = 20; // ≤100k rows/call — the rest catches up over later daily ticks
 
 // A ping used only at DO init to fail fast on a missing/unreachable database.
 export async function ping(url: string): Promise<void> {

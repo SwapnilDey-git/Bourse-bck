@@ -7,6 +7,8 @@ import {
   runSyncTick,
   runDeriveTick,
   runFreshTick,
+  planIngest,
+  type FillInsert,
   type IngestDb,
   type SyncTarget,
 } from "./ingest";
@@ -79,14 +81,12 @@ function fakeDb(overrides: Partial<IngestDb> = {}): IngestDb {
   return {
     upsertWallets: vi.fn().mockResolvedValue(0),
     claimSyncBatch: vi.fn().mockResolvedValue([]),
-    insertFills: vi.fn().mockResolvedValue(0),
+    ingestFills: vi.fn().mockResolvedValue(0),
     recordSyncSuccess: vi.fn().mockResolvedValue(undefined),
     recordSyncFailure: vi.fn().mockResolvedValue(undefined),
-    metricsCandidates: vi.fn().mockResolvedValue([]),
-    fillsForDerive: vi.fn().mockResolvedValue([]),
-    firstTradeMs: vi.fn().mockResolvedValue(null),
-    upsertMetrics: vi.fn().mockResolvedValue(undefined),
+    recomputeMetrics: vi.fn().mockResolvedValue(0),
     refreshFreshFlags: vi.fn().mockResolvedValue(0),
+    pruneOldFills: vi.fn().mockResolvedValue(0),
     ...overrides,
   };
 }
@@ -104,19 +104,22 @@ describe("runSyncTick", () => {
     });
     const db = fakeDb({
       claimSyncBatch: vi.fn().mockResolvedValue([target]),
-      insertFills: vi.fn().mockResolvedValue(1),
+      ingestFills: vi.fn().mockResolvedValue(1),
     });
 
     const outcomes: Record<string, unknown> = {};
     const result = await runSyncTick(
       db,
-      { dex: "xyz", maxPages: 6, backfillDays: 60, batchSize: 15, concurrency: 4, leaseMs: 120_000 },
+      { dex: "xyz", maxPages: 6, backfillDays: 60, keepRaw: 50, batchSize: 15, concurrency: 4, leaseMs: 120_000 },
       (address, outcome) => { outcomes[address] = outcome; },
     );
 
     expect(result.totalInserted).toBe(1);
     expect(result.walletsProcessed).toBe(1);
     expect(db.recordSyncSuccess).toHaveBeenCalledWith("0xabc", 1000, 1000);
+    expect(db.ingestFills).toHaveBeenCalledWith(
+      expect.objectContaining({ address: "0xabc", watermark: 1000, keepRaw: 50, boundaryTids: [] }),
+    );
     expect(db.recordSyncFailure).not.toHaveBeenCalled();
     expect(outcomes["0xabc"]).toEqual({ inserted: 1 });
   });
@@ -126,7 +129,7 @@ describe("runSyncTick", () => {
     vi.spyOn(hlModule, "userFillsPaged").mockRejectedValue(new Error("HL 500"));
     const db = fakeDb({ claimSyncBatch: vi.fn().mockResolvedValue([target]) });
 
-    const result = await runSyncTick(db, { dex: "xyz", maxPages: 6, backfillDays: 60, batchSize: 15, concurrency: 4, leaseMs: 120_000 });
+    const result = await runSyncTick(db, { dex: "xyz", maxPages: 6, backfillDays: 60, keepRaw: 50, batchSize: 15, concurrency: 4, leaseMs: 120_000 });
 
     expect(result.totalInserted).toBe(0);
     expect(db.recordSyncFailure).toHaveBeenCalledWith("0xdead", "HL 500");
@@ -135,33 +138,50 @@ describe("runSyncTick", () => {
 });
 
 describe("runDeriveTick", () => {
-  it("computes metrics from fills and upserts them", async () => {
-    const db = fakeDb({
-      metricsCandidates: vi.fn().mockResolvedValue([{ address: "0xabc" }]),
-      fillsForDerive: vi.fn().mockResolvedValue([
-        { time: 1_000, closed_pnl: 50, is_close: true, notional: 500 },
-      ]),
-      firstTradeMs: vi.fn().mockResolvedValue(1_000),
-    });
+  it("delegates the whole window to one recomputeMetrics call", async () => {
+    const db = fakeDb({ recomputeMetrics: vi.fn().mockResolvedValue(7) });
+    await expect(runDeriveTick(db, { windowDays: 60 })).resolves.toEqual({ processed: 7 });
+    expect(db.recomputeMetrics).toHaveBeenCalledWith(60);
+  });
+});
 
-    const { processed } = await runDeriveTick(db, { sinceMs: 0, batchSize: 200, concurrency: 8, now: 2_000 });
+const DAY = 86_400_000;
+function fill(tid: number, time: number, extra: Partial<FillInsert> = {}): FillInsert {
+  return {
+    tid, address: "0xabc", coin: "xyz:NVDA", ticker: "NVDA", side: "B", dir: "Open Long", leveraged: true,
+    sz: 1, px: 100, notional: 100, closedPnl: 0, fee: 0, isClose: false, time, ...extra,
+  };
+}
 
-    expect(processed).toBe(1);
-    expect(db.upsertMetrics).toHaveBeenCalledWith(
-      expect.objectContaining({ address: "0xabc", realizedPnl: 50, closedCount: 1 }),
-    );
+describe("planIngest", () => {
+  it("counts every row on a first sync and rolls them up per UTC day x ticker", () => {
+    const rows = [
+      fill(1, 10 * DAY + 1),
+      fill(2, 10 * DAY + 2, { isClose: true, dir: "Close Long", closedPnl: 5 }),
+      fill(3, 10 * DAY + 3, { isClose: true, dir: "Close Long", closedPnl: -2 }),
+      fill(4, 11 * DAY + 1, { ticker: "TSLA", coin: "xyz:TSLA" }),
+    ];
+    const plan = planIngest("0xabc", rows, null, 50);
+    expect(plan.boundaryTids).toEqual([]);
+    const nvda = plan.daily.find((d) => d.ticker === "NVDA")!;
+    expect(nvda).toMatchObject({ day: "1970-01-11", trades: 3, closes: 2, wins: 1, pnl: 3, firstMs: 10 * DAY + 1, lastMs: 10 * DAY + 3 });
+    expect(plan.daily.find((d) => d.ticker === "TSLA")).toMatchObject({ day: "1970-01-12", trades: 1 });
   });
 
-  it("reports (not throws) when a candidate fails", async () => {
-    const db = fakeDb({
-      metricsCandidates: vi.fn().mockResolvedValue([{ address: "0xbad" }]),
-      fillsForDerive: vi.fn().mockRejectedValue(new Error("db down")),
-    });
-    const errors: string[] = [];
-    await expect(
-      runDeriveTick(db, { sinceMs: 0, batchSize: 200, concurrency: 8, now: 2_000 }, (_addr, msg) => errors.push(msg)),
-    ).resolves.toEqual({ processed: 1 });
-    expect(errors).toEqual(["db down"]);
+  it("skips rows older than the watermark and leaves rows AT it to raw-row dedupe", () => {
+    const wm = 5_000;
+    const rows = [fill(1, 4_000), fill(2, wm), fill(3, wm), fill(4, 6_000)];
+    const plan = planIngest("0xabc", rows, wm, 50);
+    expect(plan.daily.reduce((s, d) => s + d.trades, 0)).toBe(1); // only tid 4 is new for certain
+    expect(plan.boundaryTids.sort()).toEqual([2, 3]);
+    expect(plan.tail.map((r) => r.tid)).toEqual(expect.arrayContaining([2, 3, 4]));
+  });
+
+  it("keeps only the newest keepRaw rows raw, plus every row at the newest ms", () => {
+    const rows = [fill(1, 1_000), fill(2, 2_000), fill(3, 3_000), fill(4, 3_000)];
+    const plan = planIngest("0xabc", rows, null, 1);
+    expect(plan.tail.map((r) => r.tid).sort()).toEqual([3, 4]);
+    expect(plan.daily.reduce((s, d) => s + d.trades, 0)).toBe(4); // all still counted
   });
 });
 

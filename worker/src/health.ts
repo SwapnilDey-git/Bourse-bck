@@ -10,7 +10,7 @@
 //      server stays off unless an operator opts in and wires a platform
 //      health check to it.
 
-type LoopName = "discover" | "sync" | "derive" | "fresh";
+type LoopName = "discover" | "sync" | "derive" | "fresh" | "retain";
 
 type LoopStatus = { lastTickAt: number; lastError: string | null; intervalMs: number };
 
@@ -19,6 +19,7 @@ const status: Record<LoopName, LoopStatus> = {
   sync: { lastTickAt: 0, lastError: null, intervalMs: 0 },
   derive: { lastTickAt: 0, lastError: null, intervalMs: 0 },
   fresh: { lastTickAt: 0, lastError: null, intervalMs: 0 },
+  retain: { lastTickAt: 0, lastError: null, intervalMs: 0 },
 };
 
 export function reportTick(loop: LoopName, intervalMs: number, error?: string): void {

@@ -9,19 +9,16 @@
 
 import pg from "pg";
 import { config } from "./config";
-import { nextAttemptDelay, type IngestDb, type FillInsert, type SyncTarget } from "./core";
+import {
+  nextAttemptDelay, INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+  type IngestDb, type IngestBatch, type SyncTarget,
+} from "./core";
 
 export const pool = new pg.Pool({
   connectionString: config.databaseUrl,
   max: 4,
   idleTimeoutMillis: 30_000,
 });
-
-type Row = Record<string, unknown>;
-async function q<T = Row>(text: string, params: unknown[] = []): Promise<T[]> {
-  const res = await pool.query(text, params);
-  return res.rows as T[];
-}
 
 // ── wallet universe (discover) ───────────────────────────────────────────────
 // Upsert a batch of newly-seen addresses. New rows land as tier 'new' (unindexed);
@@ -62,33 +59,15 @@ async function claimSyncBatch(limit: number, leaseMs: number): Promise<SyncTarge
   return res.rows;
 }
 
-// Append fills idempotently (tid PK). A hyperactive wallet can drain thousands of
-// fills per pass, so we CHUNK the multi-row insert: 14 params/row × 500 rows = 7000
-// params, comfortably under Postgres's 65535-parameter bind ceiling (a single giant
-// statement overflows it and fails with "bind message has N parameter formats…").
-const FILL_COLS = 14;
-const FILL_CHUNK = 500;
-
-async function insertFills(rows: FillInsert[]): Promise<number> {
-  if (!rows.length) return 0;
-  let inserted = 0;
-  for (let off = 0; off < rows.length; off += FILL_CHUNK) {
-    const chunk = rows.slice(off, off + FILL_CHUNK);
-    const values: unknown[] = [];
-    const tuples = chunk.map((r, i) => {
-      const b = i * FILL_COLS;
-      values.push(r.tid, r.address, r.coin, r.ticker, r.side, r.dir, r.leveraged,
-        r.sz, r.px, r.notional, r.closedPnl, r.fee, r.isClose, new Date(r.time));
-      return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13},$${b + 14})`;
-    });
-    const res = await pool.query(
-      `INSERT INTO fill (tid,address,coin,ticker,side,dir,leveraged,sz,px,notional,closed_pnl,fee,is_close,time)
-       VALUES ${tuples.join(",")} ON CONFLICT (tid) DO NOTHING`,
-      values,
-    );
-    inserted += res.rowCount ?? 0;
-  }
-  return inserted;
+// Fold one wallet's pass into fill_daily + its raw tail (src/lib/wallets/sql.ts
+// has the statement and why it's a single one). JSON params, so a hyperactive
+// wallet's batch never hits Postgres's 65535-bind-parameter ceiling.
+async function ingestFills(b: IngestBatch): Promise<number> {
+  const res = await pool.query<{ counted: number }>(INGEST_FILLS_SQL, [
+    JSON.stringify(b.tail), b.boundaryTids, JSON.stringify(b.daily), b.address, b.watermark,
+  ]);
+  await pool.query(TRIM_RAW_FILLS_SQL, [b.address, b.keepRaw]);
+  return res.rows[0]?.counted ?? 0;
 }
 
 // Sync succeeded: advance the watermark, set the age basis if unset, clear the
@@ -123,51 +102,10 @@ async function recordSyncFailure(address: string, message: string): Promise<void
 }
 
 // ── derive (metrics) ─────────────────────────────────────────────────────────
-// Wallets with any fill in the window, LEAST-recently-derived first — plain
-// `SELECT DISTINCT ... LIMIT n` with no ORDER BY had no rotation guarantee, so
-// past `limit` distinct wallets some could starve indefinitely (review
-// finding: "some wallets may not get their metrics updated"). Wallets never
-// derived (no wallet_metrics row yet) sort first via NULLS FIRST.
-async function metricsCandidates(sinceMs: number, limit: number): Promise<{ address: string }[]> {
-  return q<{ address: string }>(
-    `SELECT f.address FROM (SELECT DISTINCT address FROM fill WHERE time >= $1) f
-     LEFT JOIN wallet_metrics wm ON wm.address = f.address
-     ORDER BY wm.computed_at ASC NULLS FIRST
-     LIMIT $2`,
-    [new Date(sinceMs), limit],
-  );
-}
-
-type DeriveFillRow = { time: number; closed_pnl: number; is_close: boolean; notional: number };
-function fillsForDerive(address: string, sinceMs: number): Promise<DeriveFillRow[]> {
-  return q<DeriveFillRow>(
-    `SELECT extract(epoch FROM time)*1000 AS time, closed_pnl, is_close, notional
-     FROM fill WHERE address = $1 AND time >= $2`,
-    [address, new Date(sinceMs)],
-  );
-}
-
-async function firstTradeMs(address: string): Promise<number | null> {
-  const res = await pool.query<{ t: number | null }>(
-    `SELECT extract(epoch FROM first_hip3_trade_at)*1000 AS t FROM wallet WHERE address = $1`,
-    [address],
-  );
-  return res.rows[0]?.t ? Number(res.rows[0].t) : null;
-}
-
-async function upsertMetrics(m: {
-  address: string; realizedPnl: number; winRate: number; tradeCount: number;
-  closedCount: number; activeDays: number; ageDays: number; qualifiesWinRate: boolean;
-}): Promise<void> {
-  await pool.query(
-    `INSERT INTO wallet_metrics
-       (address, realized_pnl, win_rate, trade_count, closed_count, active_days, age_days, qualifies_winrate, computed_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
-     ON CONFLICT (address) DO UPDATE SET
-       realized_pnl=$2, win_rate=$3, trade_count=$4, closed_count=$5,
-       active_days=$6, age_days=$7, qualifies_winrate=$8, computed_at=now()`,
-    [m.address, m.realizedPnl, m.winRate, m.tradeCount, m.closedCount, m.activeDays, m.ageDays, m.qualifiesWinRate],
-  );
+// Every wallet in the window, recomputed in one statement over fill_daily.
+async function recomputeMetrics(windowDays: number): Promise<number> {
+  const res = await pool.query(RECOMPUTE_METRICS_SQL, [windowDays]);
+  return res.rowCount ?? 0;
 }
 
 // ── fresh-flag ───────────────────────────────────────────────────────────────
@@ -184,15 +122,30 @@ async function refreshFreshFlags(maxAgeDays: number): Promise<number> {
   return res.rowCount ?? 0;
 }
 
+// ── retain (Neon storage) ─────────────────────────────────────────────────
+// fill_daily in one DELETE; raw rows batched for the same reason as
+// worker-cf/src/db.ts's version — work down PRUNE_BATCHES chunks per tick.
+const PRUNE_BATCH_SIZE = 5_000;
+const PRUNE_BATCHES = 20;
+async function pruneOldFills(beforeMs: number): Promise<number> {
+  const daily = await pool.query(PRUNE_DAILY_SQL, [beforeMs]);
+  let total = daily.rowCount ?? 0;
+  for (let i = 0; i < PRUNE_BATCHES; i++) {
+    const res = await pool.query(PRUNE_RAW_SQL, [beforeMs, PRUNE_BATCH_SIZE]);
+    const n = res.rowCount ?? 0;
+    total += n;
+    if (n < PRUNE_BATCH_SIZE) break;
+  }
+  return total;
+}
+
 export const db: IngestDb = {
   upsertWallets,
   claimSyncBatch,
-  insertFills,
+  ingestFills,
   recordSyncSuccess,
   recordSyncFailure,
-  metricsCandidates,
-  fillsForDerive,
-  firstTradeMs,
-  upsertMetrics,
+  recomputeMetrics,
   refreshFreshFlags,
+  pruneOldFills,
 };

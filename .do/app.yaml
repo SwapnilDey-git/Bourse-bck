@@ -35,7 +35,7 @@ workers:
         value: "6"
       - key: SYNC_BATCH_SIZE
         scope: RUN_TIME
-        value: "15"
+        value: "60"
       - key: BOURSE_DEX
         scope: RUN_TIME
         value: xyz

@@ -10,7 +10,6 @@
 import * as hl from "../hl";
 import { classify } from "../symbols";
 import { EQUITY_META, INDEX_META } from "../symbols/table";
-import { deriveMetrics, ageDaysFrom, type MetricFill } from "./metrics";
 
 export type SyncTarget = { address: string; last_indexed_at: string | null };
 
@@ -20,7 +19,38 @@ export type FillInsert = {
   notional: number; closedPnl: number; fee: number; isClose: boolean; time: number;
 };
 
-export type DeriveFill = { time: number; closed_pnl: number; is_close: boolean; notional: number };
+// One wallet × UTC day × ticker rollup — the unit `fill_daily` stores. Every
+// leaderboard metric (P&L, win rate, trade/closed counts, active span) is a sum
+// or min/max over these, so the worker no longer keeps every raw fill: a market
+// maker doing 5k fills/day costs one row per ticker per day instead of 5k rows
+// (incident 2026-10-01: raw `fill` hit the 512 MB cap in under an hour).
+export type DailyAgg = {
+  day: string;      // "YYYY-MM-DD", UTC
+  ticker: string;
+  trades: number;
+  closes: number;
+  wins: number;     // closes with closed_pnl > 0
+  pnl: number;      // Σ closed_pnl over closes
+  firstMs: number;
+  lastMs: number;
+};
+
+// What one sync pass hands the db for one wallet (see planIngest for how it's built).
+export type IngestBatch = {
+  address: string;
+  // Raw rows to keep: the newest few (what profiles/asset tabs display) plus any
+  // row at the new or old watermark ms (see `boundaryTids`).
+  tail: FillInsert[];
+  // Fills at exactly the previous watermark ms. They may already have been
+  // counted last pass, so they're counted only if their tid is NEW to `fill` —
+  // the one place raw-row dedupe is still needed.
+  boundaryTids: number[];
+  // Pre-aggregated fills strictly newer than the previous watermark — new by
+  // construction, counted unconditionally.
+  daily: DailyAgg[];
+  watermark: number;
+  keepRaw: number;
+};
 
 // Every write the loops need, behind one interface — implemented once per
 // runtime (worker/src/db.ts on pg, worker-cf/src/db.ts on @neondatabase/serverless).
@@ -34,19 +64,24 @@ export interface IngestDb {
   // memory — see worker/README.md's "Known limits" note before running >1
   // instance.)
   claimSyncBatch(limit: number, leaseMs: number): Promise<SyncTarget[]>;
-  insertFills(rows: FillInsert[]): Promise<number>;
+  // ONE statement: insert `tail` raw rows, add `daily` + newly-inserted boundary
+  // rows into fill_daily, and advance the wallet's watermark — atomic, so a
+  // crash between steps can't double-count a fill on the retry. Then trims the
+  // wallet's raw rows back to `keepRaw` (never dropping the watermark ms).
+  // Returns how many fills were newly counted.
+  ingestFills(batch: IngestBatch): Promise<number>;
   recordSyncSuccess(address: string, watermark: number, earliestFill: number | null): Promise<void>;
   recordSyncFailure(address: string, message: string): Promise<void>;
 
-  metricsCandidates(sinceMs: number, limit: number): Promise<{ address: string }[]>;
-  fillsForDerive(address: string, sinceMs: number): Promise<DeriveFill[]>;
-  firstTradeMs(address: string): Promise<number | null>;
-  upsertMetrics(m: {
-    address: string; realizedPnl: number; winRate: number; tradeCount: number;
-    closedCount: number; activeDays: number; ageDays: number; qualifiesWinRate: boolean;
-  }): Promise<void>;
+  // Recompute wallet_metrics for every wallet active in the window, in SQL over
+  // fill_daily (no raw rows leave the database). Returns rows changed.
+  recomputeMetrics(windowDays: number): Promise<number>;
 
   refreshFreshFlags(maxAgeDays: number): Promise<number>;
+
+  // Delete fill_daily days and raw `fill` rows older than `beforeMs`.
+  // Implementations batch the raw delete so a backlog can't hold one long lock.
+  pruneOldFills(beforeMs: number): Promise<number>;
 }
 
 export const DAY_MS = 86_400_000;
@@ -120,25 +155,78 @@ export function buildFillRows(
   return { rows, earliest };
 }
 
-function watermarkOf(t: SyncTarget, backfillDays: number): number {
-  return t.last_indexed_at ? Date.parse(t.last_indexed_at) : sinceWindow(backfillDays);
+// The stored watermark at full ms precision. pg hands timestamptz back as a
+// Date and the neon HTTP driver as an ISO string — `new Date(x)` takes either
+// (Date.parse(String(date)) used to round a Date down to the whole second).
+function storedWatermark(t: SyncTarget): number | null {
+  return t.last_indexed_at ? new Date(t.last_indexed_at as unknown as string | Date).getTime() : null;
 }
 
-export type SyncOpts = { dex: string; maxPages: number; backfillDays: number };
+const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+// Split one pass's rows into what to count and what raw rows to keep.
+// userFillsByTime's startTime is inclusive and the watermark is the previous
+// pass's max fill time, so: rows newer than the watermark are new for certain,
+// rows older were counted already, and rows AT the watermark ms are the only
+// ambiguous ones — kept raw so the tid primary key decides (`boundaryTids`).
+// Pure, so it's unit-tested without a database.
+export function planIngest(
+  address: string,
+  rows: FillInsert[],
+  prevWatermark: number | null,
+  keepRaw: number,
+): Omit<IngestBatch, "watermark"> {
+  const fresh = prevWatermark === null ? rows : rows.filter((r) => r.time > prevWatermark);
+  const boundary = prevWatermark === null ? [] : rows.filter((r) => r.time === prevWatermark);
+
+  const byKey = new Map<string, DailyAgg>();
+  for (const r of fresh) {
+    const day = utcDay(r.time);
+    const key = `${day}|${r.ticker}`;
+    let a = byKey.get(key);
+    if (!a) {
+      a = { day, ticker: r.ticker, trades: 0, closes: 0, wins: 0, pnl: 0, firstMs: r.time, lastMs: r.time };
+      byKey.set(key, a);
+    }
+    a.trades++;
+    if (r.isClose) {
+      a.closes++;
+      a.pnl += r.closedPnl;
+      if (r.closedPnl > 0) a.wins++;
+    }
+    if (r.time < a.firstMs) a.firstMs = r.time;
+    if (r.time > a.lastMs) a.lastMs = r.time;
+  }
+
+  // Raw rows worth writing: the newest `keepRaw`, everything at the newest ms
+  // (next pass's boundary), and the boundary rows themselves. Anything else
+  // would be trimmed straight back out, so it's never inserted.
+  const maxT = rows.reduce((m, r) => Math.max(m, r.time), -Infinity);
+  const newest = [...rows].sort((a, b) => b.time - a.time || b.tid - a.tid).slice(0, keepRaw);
+  const tail = new Map<number, FillInsert>();
+  for (const r of [...newest, ...rows.filter((r) => r.time === maxT), ...boundary]) tail.set(r.tid, r);
+
+  return { address, tail: [...tail.values()], boundaryTids: boundary.map((r) => r.tid), daily: [...byKey.values()], keepRaw };
+}
+
+export type SyncOpts = { dex: string; maxPages: number; backfillDays: number; keepRaw: number };
 
 // One wallet's sync pass: page userFillsByTime forward from its watermark and
-// insert new fills. Throws on failure — the caller (runSyncTick) persists
-// success/failure so retry/backoff policy lives in one place.
+// fold the new fills into fill_daily. Throws on failure — the caller
+// (runSyncTick) persists success/failure so retry/backoff policy lives in one place.
 export async function syncOneWallet(
-  db: Pick<IngestDb, "insertFills">,
+  db: Pick<IngestDb, "ingestFills">,
   target: SyncTarget,
   opts: SyncOpts,
 ): Promise<{ inserted: number; watermark: number; earliest: number | null }> {
-  const start = watermarkOf(target, opts.backfillDays);
+  const prev = storedWatermark(target);
+  const start = prev ?? sinceWindow(opts.backfillDays);
   const { fills } = await hl.userFillsPaged(target.address, start, { maxPages: opts.maxPages });
   const { rows, earliest } = buildFillRows(target.address, fills, opts.dex);
-  const inserted = await db.insertFills(rows);
   const watermark = fills.length ? Math.max(...fills.map((f) => f.time)) : Date.now();
+  const inserted = rows.length
+    ? await db.ingestFills({ ...planIngest(target.address, rows, prev, opts.keepRaw), watermark })
+    : 0;
   return { inserted, watermark, earliest };
 }
 
@@ -191,33 +279,15 @@ export async function runSyncTick(
 }
 
 // ── the derive tick ──────────────────────────────────────────────────────────
+// One set-based statement over fill_daily (the same math as deriveMetrics in
+// ./metrics, written in SQL) — replaces pulling every wallet's raw fills into
+// JS, which was ~all of the project's egress. The window is whole UTC days, so
+// it can include up to one day more than deriveMetrics' exact-ms cutoff.
 export async function runDeriveTick(
-  db: Pick<IngestDb, "metricsCandidates" | "fillsForDerive" | "firstTradeMs" | "upsertMetrics">,
-  opts: { sinceMs: number; batchSize: number; concurrency: number; now: number },
-  onError?: (address: string, message: string) => void,
+  db: Pick<IngestDb, "recomputeMetrics">,
+  opts: { windowDays: number },
 ): Promise<{ processed: number }> {
-  const candidates = await db.metricsCandidates(opts.sinceMs, opts.batchSize);
-  await mapWithConcurrency(candidates, opts.concurrency, async ({ address }) => {
-    try {
-      const raw = await db.fillsForDerive(address, opts.sinceMs);
-      const m = deriveMetrics(
-        raw.map(
-          (f): MetricFill => ({
-            time: Number(f.time),
-            closedPnl: Number(f.closed_pnl),
-            isClose: f.is_close,
-            notional: Number(f.notional),
-          }),
-        ),
-        opts.now,
-      );
-      const firstMs = await db.firstTradeMs(address);
-      await db.upsertMetrics({ address, ...m, ageDays: ageDaysFrom(firstMs, opts.now) });
-    } catch (err) {
-      onError?.(address, (err as Error).message ?? String(err));
-    }
-  });
-  return { processed: candidates.length };
+  return { processed: await db.recomputeMetrics(opts.windowDays) };
 }
 
 export async function runFreshTick(
@@ -225,4 +295,15 @@ export async function runFreshTick(
   maxAgeDays: number,
 ): Promise<number> {
   return db.refreshFreshFlags(maxAgeDays);
+}
+
+// ── the retain tick ───────────────────────────────────────────────────────
+// Nothing in the live UI reads past the 60-day metrics window (wallets/index.ts
+// caps at 60 days or the last 40 raw rows) — retentionDays is that window plus
+// the one partial day runDeriveTick's whole-day window can reach back into.
+export async function runRetainTick(
+  db: Pick<IngestDb, "pruneOldFills">,
+  opts: { retentionDays: number },
+): Promise<number> {
+  return db.pruneOldFills(sinceWindow(opts.retentionDays));
 }

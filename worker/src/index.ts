@@ -1,7 +1,7 @@
 // Bourse Stage-2 worker — the always-on ingestion service (ARCHITECTURE.md · Diagram B).
-// Runs the four loops behind one process / one egress IP / one shared hl token bucket:
+// Runs the five loops behind one process / one egress IP / one shared hl token bucket:
 //   discover (trades WS → wallet universe) · sync (userFills → fill) ·
-//   derive (fill → wallet_metrics) · fresh-flag (<30d set).
+//   derive (fill → wallet_metrics) · fresh-flag (<30d set) · retain (prune old fill rows).
 // The browser and the Vercel Read API never run any of this — they only read the
 // Postgres this fills. Schema is applied out-of-band (db/schema.sql); the worker
 // assumes the tables exist and fails loudly if DATABASE_URL is missing.
@@ -12,6 +12,7 @@ import { startDiscover, stopDiscover } from "./loops/discover";
 import { startSync, stopSync } from "./loops/sync";
 import { startDerive, stopDerive } from "./loops/derive";
 import { startFresh, stopFresh } from "./loops/fresh";
+import { startRetain, stopRetain } from "./loops/retain";
 import { startHeartbeatLog, stopHeartbeatLog, startHealthServer, stopHealthServer } from "./health";
 
 async function main() {
@@ -33,15 +34,17 @@ async function main() {
   startSync();
   startDerive();
   startFresh();
+  startRetain();
   startHeartbeatLog();
   if (config.healthPort) startHealthServer(config.healthPort);
-  console.log("[worker] all four loops running");
+  console.log("[worker] all five loops running");
 }
 
 async function shutdown(sig: string) {
   console.log(`[worker] ${sig} — draining`);
   stopHealthServer();
   stopHeartbeatLog();
+  stopRetain();
   stopFresh();
   stopDerive();
   stopSync();

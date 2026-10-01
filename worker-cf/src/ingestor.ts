@@ -1,4 +1,4 @@
-// The Ingestor Durable Object — the four ingestion loops as a single Cloudflare-hosted
+// The Ingestor Durable Object — the five ingestion loops as a single Cloudflare-hosted
 // isolate. It reuses the SAME orchestration the Railway worker uses
 // (../../src/lib/wallets/ingest.ts, which itself sits on ../../src/lib/{hl,symbols}) —
 // all fetch-based/pure, so it runs unchanged in the Workers runtime. Only the
@@ -16,7 +16,7 @@
 import * as hl from "../../src/lib/hl";
 import { classify } from "../../src/lib/symbols";
 import { FRESH_MAX_AGE_DAYS, WINDOW_DAYS } from "../../src/lib/wallets/metrics";
-import { runSyncTick, runDeriveTick, runFreshTick, sinceWindow, type IngestDb } from "../../src/lib/wallets/ingest";
+import { runSyncTick, runDeriveTick, runFreshTick, runRetainTick, DAY_MS, type IngestDb } from "../../src/lib/wallets/ingest";
 import { makeDb, ping } from "./db";
 
 export interface Env {
@@ -30,9 +30,11 @@ export interface Env {
   SYNC_CONCURRENCY?: string;
   SYNC_LEASE_MS?: string;
   DERIVE_INTERVAL_MS?: string;
-  DERIVE_CONCURRENCY?: string;
+  DISCOVER_FLUSH_MS?: string;
+  RAW_FILLS_PER_WALLET?: string;
   FRESH_INTERVAL_MS?: string;
   BACKFILL_DAYS?: string;
+  FILL_RETENTION_DAYS?: string;
 }
 
 const numEnv = (v: string | undefined, dflt: number) => {
@@ -44,7 +46,7 @@ type Trade = { coin: string; users?: [string, string] };
 
 // One alarm drives every loop. Each loop has an interval and a next-due timestamp;
 // alarm() runs whatever is due, re-arms each, then sets the alarm to the soonest.
-type Loop = "flush" | "discover" | "sync" | "derive" | "fresh";
+type Loop = "flush" | "discover" | "sync" | "derive" | "fresh" | "retain";
 
 export class Ingestor {
   private state: DurableObjectState;
@@ -53,7 +55,7 @@ export class Ingestor {
   private dex: string;
   private cfg: {
     syncMs: number; syncBatch: number; syncPages: number; syncConcurrency: number; syncLeaseMs: number;
-    deriveMs: number; deriveConcurrency: number; freshMs: number; backfillDays: number;
+    deriveMs: number; flushMs: number; keepRaw: number; freshMs: number; backfillDays: number; retentionDays: number;
   };
 
   private coins: string[] = [];
@@ -71,22 +73,27 @@ export class Ingestor {
     this.db = makeDb(env.DATABASE_URL);
     this.dex = env.BOURSE_DEX ?? "xyz";
     this.cfg = {
-      syncMs: numEnv(env.SYNC_INTERVAL_MS, 30_000),
-      syncBatch: numEnv(env.SYNC_BATCH_SIZE, 15),
+      // Same 2-minute beat as ../worker/src/config.ts (see there for the budget math).
+      syncMs: numEnv(env.SYNC_INTERVAL_MS, 120_000),
+      syncBatch: numEnv(env.SYNC_BATCH_SIZE, 60),
       syncPages: numEnv(env.SYNC_MAX_PAGES, 6),
       syncConcurrency: numEnv(env.SYNC_CONCURRENCY, 4),
-      syncLeaseMs: numEnv(env.SYNC_LEASE_MS, 120_000),
-      deriveMs: numEnv(env.DERIVE_INTERVAL_MS, 60_000),
-      deriveConcurrency: numEnv(env.DERIVE_CONCURRENCY, 8),
+      syncLeaseMs: numEnv(env.SYNC_LEASE_MS, 300_000),
+      deriveMs: numEnv(env.DERIVE_INTERVAL_MS, 120_000),
+      flushMs: numEnv(env.DISCOVER_FLUSH_MS, 120_000),
+      keepRaw: numEnv(env.RAW_FILLS_PER_WALLET, 50),
       freshMs: numEnv(env.FRESH_INTERVAL_MS, 300_000),
       backfillDays: numEnv(env.BACKFILL_DAYS, 60),
+      // The 60-day metrics window plus the one partial UTC day it can reach into.
+      retentionDays: numEnv(env.FILL_RETENTION_DAYS, 61),
     };
     this.loops = {
-      flush: { every: 5_000, next: 0 },
+      flush: { every: this.cfg.flushMs, next: 0 },
       discover: { every: 600_000, next: 0 }, // refresh coin list + resubscribe new
       sync: { every: this.cfg.syncMs, next: 0 },
       derive: { every: this.cfg.deriveMs, next: 0 },
       fresh: { every: this.cfg.freshMs, next: 0 },
+      retain: { every: DAY_MS, next: 0 }, // next:0 → also runs on first alarm tick
     };
   }
 
@@ -196,6 +203,7 @@ export class Ingestor {
     if (loop === "sync") return this.sync();
     if (loop === "derive") return this.derive();
     if (loop === "fresh") return this.fresh();
+    if (loop === "retain") return this.retain();
   }
 
   // ── loops — thin wrappers over the shared src/lib/wallets/ingest.ts ─────
@@ -224,6 +232,7 @@ export class Ingestor {
         dex: this.dex,
         maxPages: this.cfg.syncPages,
         backfillDays: this.cfg.backfillDays,
+        keepRaw: this.cfg.keepRaw,
         batchSize: this.cfg.syncBatch,
         concurrency: this.cfg.syncConcurrency,
         leaseMs: this.cfg.syncLeaseMs,
@@ -236,16 +245,17 @@ export class Ingestor {
   }
 
   private async derive() {
-    const { processed } = await runDeriveTick(
-      this.db,
-      { sinceMs: sinceWindow(WINDOW_DAYS), batchSize: 200, concurrency: this.cfg.deriveConcurrency, now: Date.now() },
-      (address, message) => console.error(`[cf] derive ${address}:`, message),
-    );
+    const { processed } = await runDeriveTick(this.db, { windowDays: WINDOW_DAYS });
     if (processed) console.log(`[cf] derive ${processed} wallets`);
   }
 
   private async fresh() {
     const changed = await runFreshTick(this.db, FRESH_MAX_AGE_DAYS);
     if (changed) console.log(`[cf] fresh flipped ${changed}`);
+  }
+
+  private async retain() {
+    const deleted = await runRetainTick(this.db, { retentionDays: this.cfg.retentionDays });
+    if (deleted) console.log(`[cf] retain -${deleted} fills older than ${this.cfg.retentionDays}d`);
   }
 }

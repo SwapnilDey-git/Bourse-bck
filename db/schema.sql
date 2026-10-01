@@ -87,13 +87,19 @@ CREATE TABLE IF NOT EXISTS fill (
   is_close    BOOLEAN NOT NULL DEFAULT FALSE, -- dir LIKE 'Close%' → counts toward win-rate
   time        TIMESTAMPTZ NOT NULL         -- fill time (HL ms → tz)
 );
+-- Since migration 0005 `fill` holds only each wallet's newest ~50 rows (the
+-- UI's raw-trade views); full history lives as daily rollups in `fill_daily`.
+-- fill_coin_time_idx / fill_time_idx were dropped in 0004 — don't re-add them
+-- here, or re-applying this file would quietly bring them back.
 CREATE INDEX IF NOT EXISTS fill_address_time_idx ON fill (address, time DESC);
-CREATE INDEX IF NOT EXISTS fill_coin_time_idx    ON fill (coin, time DESC);
-CREATE INDEX IF NOT EXISTS fill_time_idx         ON fill (time DESC);
--- Backs relatedWallets' (§10.13) cross-wallet-by-ticker join in src/lib/wallets —
--- "which other wallets traded any of MY tickers in the last 60 days" fans out
--- from this index rather than a precomputed O(wallets²) pairwise table.
+-- Backs assetTrades' latest-fill-per-wallet-on-a-ticker read in src/lib/wallets.
 CREATE INDEX IF NOT EXISTS fill_ticker_time_idx  ON fill (ticker, time DESC);
+-- fill now churns both ways (worker sync inserts + the retain loop's batched
+-- deletes, src/lib/wallets/ingest.ts's runRetainTick) — the default 20%
+-- dead-tuple threshold lets bloat pile up between autovacuum passes on a
+-- table this size, which is exactly what let Neon storage creep to its cap
+-- undetected (incident 2026-09-29). Tightened so cleanup gets reclaimed promptly.
+ALTER TABLE fill SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
 
 -- ── wallet_metrics ─────────────────────────────────────────────────────────
 -- The precomputed leaderboard row, recomputed by the derive loop over the
