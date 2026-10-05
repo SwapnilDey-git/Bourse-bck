@@ -21,16 +21,17 @@ export const config = {
 
   // Discovery — refresh the tracked equity-coin list from perpDexs/meta this often.
   discoverRefreshMs: num("DISCOVER_REFRESH_MS", 10 * 60_000),
-  // Buffer address upserts and flush in batches to keep PG writes cheap. Every
-  // DB-writing loop runs on the same 2-minute beat, so Neon sees one burst of
-  // writes per cycle instead of a statement every few seconds.
-  discoverFlushMs: num("DISCOVER_FLUSH_MS", 120_000),
+  // Buffer address upserts and flush in batches to keep PG writes cheap. The
+  // flush is also what marks a wallet due for sync (last_trade_seen_at), so it
+  // runs on the sync beat — a trade waits at most one flush to enter the queue.
+  discoverFlushMs: num("DISCOVER_FLUSH_MS", 30_000),
 
   // Sync — the budget-dominating loop. At ~25 wt/userFills and a 1000-wt working
-  // limit, the ceiling is ~40 wallet refreshes/min. 60 wallets / 2 min = 30/min,
-  // the same throughput as the old 15 / 30 s, leaving headroom for market polling.
-  syncIntervalMs: num("SYNC_INTERVAL_MS", 120_000),
-  syncBatchSize: num("SYNC_BATCH_SIZE", 60),
+  // limit, the ceiling is ~40 wallet refreshes/min. 15 wallets / 30 s = 30/min,
+  // the same throughput as the 2-minute beat, but a just-traded wallet (claimed
+  // first since migration 0006) waits one 30 s tick instead of up to two minutes.
+  syncIntervalMs: num("SYNC_INTERVAL_MS", 30_000),
+  syncBatchSize: num("SYNC_BATCH_SIZE", 15),
   // Pages drained per wallet per pass. userFillsByTime caps at 2000/page and the
   // fetch paginates FORWARD through it (verified 2026-08-27). A hyperactive wallet's
   // full 60-day backfill can span hundreds of pages — cap it so one greedy wallet

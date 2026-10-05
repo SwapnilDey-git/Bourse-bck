@@ -33,11 +33,11 @@ crons = ["* * * * *"]
 [vars]
 BOURSE_DEX = "xyz"
 # Loop cadences (ms) — override here or leave the in-code defaults.
-# SYNC_INTERVAL_MS = "120000"
-# SYNC_BATCH_SIZE  = "60"
+# SYNC_INTERVAL_MS = "30000"
+# SYNC_BATCH_SIZE  = "15"
 # SYNC_MAX_PAGES   = "6"
 # DERIVE_INTERVAL_MS = "120000"
-# DISCOVER_FLUSH_MS  = "120000"
+# DISCOVER_FLUSH_MS  = "30000"
 # RAW_FILLS_PER_WALLET = "50"
 # FRESH_INTERVAL_MS  = "300000"
 # BACKFILL_DAYS      = "60"

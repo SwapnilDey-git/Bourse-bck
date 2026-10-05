@@ -73,14 +73,14 @@ export class Ingestor {
     this.db = makeDb(env.DATABASE_URL);
     this.dex = env.BOURSE_DEX ?? "xyz";
     this.cfg = {
-      // Same 2-minute beat as ../worker/src/config.ts (see there for the budget math).
-      syncMs: numEnv(env.SYNC_INTERVAL_MS, 120_000),
-      syncBatch: numEnv(env.SYNC_BATCH_SIZE, 60),
+      // Same cadence as ../worker/src/config.ts (see there for the budget math).
+      syncMs: numEnv(env.SYNC_INTERVAL_MS, 30_000),
+      syncBatch: numEnv(env.SYNC_BATCH_SIZE, 15),
       syncPages: numEnv(env.SYNC_MAX_PAGES, 6),
       syncConcurrency: numEnv(env.SYNC_CONCURRENCY, 4),
       syncLeaseMs: numEnv(env.SYNC_LEASE_MS, 300_000),
       deriveMs: numEnv(env.DERIVE_INTERVAL_MS, 120_000),
-      flushMs: numEnv(env.DISCOVER_FLUSH_MS, 120_000),
+      flushMs: numEnv(env.DISCOVER_FLUSH_MS, 30_000),
       keepRaw: numEnv(env.RAW_FILLS_PER_WALLET, 50),
       freshMs: numEnv(env.FRESH_INTERVAL_MS, 300_000),
       backfillDays: numEnv(env.BACKFILL_DAYS, 60),

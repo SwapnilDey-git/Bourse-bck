@@ -11,6 +11,7 @@ import pg from "pg";
 import { config } from "./config";
 import {
   nextAttemptDelay, INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+  UPSERT_WALLETS_SQL, CLAIM_SYNC_BATCH_SQL, RECORD_SYNC_FAILURE_SQL,
   type IngestDb, type IngestBatch, type SyncTarget,
 } from "./core";
 
@@ -21,17 +22,15 @@ export const pool = new pg.Pool({
 });
 
 // ── wallet universe (discover) ───────────────────────────────────────────────
-// Upsert a batch of newly-seen addresses. New rows land as tier 'new' (unindexed);
-// re-seeing a known wallet is a no-op. Returns count of genuinely-new wallets.
+// Upsert a batch of addresses just seen trading. New rows land as tier 'new'
+// (unindexed); every row, new or known, is stamped last_trade_seen_at, which
+// is what puts it at the front of claimSyncBatch's queue (src/lib/wallets/sql.ts).
+// Returns count of genuinely-new wallets.
 async function upsertWallets(addresses: string[]): Promise<number> {
   if (!addresses.length) return 0;
   const uniq = [...new Set(addresses.map((a) => a.toLowerCase()))];
-  const res = await pool.query(
-    `INSERT INTO wallet (address) SELECT unnest($1::text[])
-     ON CONFLICT (address) DO NOTHING`,
-    [uniq],
-  );
-  return res.rowCount ?? 0;
+  const res = await pool.query<{ inserted: boolean }>(UPSERT_WALLETS_SQL, [uniq]);
+  return res.rows.filter((r) => r.inserted).length;
 }
 
 // ── sync (userFills poller) ──────────────────────────────────────────────────
@@ -41,21 +40,9 @@ async function upsertWallets(addresses: string[]): Promise<number> {
 // data-safety half of that fix; the shared hl rate budget is still process-
 // local, see worker/README.md). FOR UPDATE SKIP LOCKED inside the CTE means two
 // concurrent claimers get disjoint sets instead of blocking on each other.
+// Queue order is in src/lib/wallets/sql.ts (just-traded wallets first).
 async function claimSyncBatch(limit: number, leaseMs: number): Promise<SyncTarget[]> {
-  const res = await pool.query<SyncTarget>(
-    `WITH due AS (
-       SELECT address FROM wallet
-       WHERE (claimed_until IS NULL OR claimed_until <= now())
-         AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-       ORDER BY (tier='hot') DESC, last_indexed_at ASC NULLS FIRST
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED
-     )
-     UPDATE wallet SET claimed_until = now() + ($2 || ' milliseconds')::interval
-     FROM due WHERE wallet.address = due.address
-     RETURNING wallet.address, wallet.last_indexed_at`,
-    [limit, leaseMs],
-  );
+  const res = await pool.query<SyncTarget>(CLAIM_SYNC_BATCH_SQL, [limit, leaseMs]);
   return res.rows;
 }
 
@@ -89,11 +76,7 @@ async function recordSyncSuccess(address: string, watermark: number, earliestFil
 // of claimSyncBatch's queue (review finding: "a failing wallet can keep
 // getting retried").
 async function recordSyncFailure(address: string, message: string): Promise<void> {
-  const res = await pool.query<{ fail_count: number }>(
-    `UPDATE wallet SET fail_count = fail_count + 1, last_error = $2, claimed_until = NULL
-     WHERE address = $1 RETURNING fail_count`,
-    [address, message.slice(0, 500)],
-  );
+  const res = await pool.query<{ fail_count: number }>(RECORD_SYNC_FAILURE_SQL, [address, message.slice(0, 500)]);
   const failCount = res.rows[0]?.fail_count ?? 1;
   await pool.query(
     `UPDATE wallet SET next_attempt_at = $2 WHERE address = $1`,

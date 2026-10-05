@@ -18,4 +18,5 @@ export {
 } from "../../src/lib/wallets/ingest";
 export {
   INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+  UPSERT_WALLETS_SQL, CLAIM_SYNC_BATCH_SQL, RECORD_SYNC_FAILURE_SQL,
 } from "../../src/lib/wallets/sql";

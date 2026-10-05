@@ -101,3 +101,49 @@ DELETE FROM fill_daily WHERE day < (to_timestamp($1 / 1000.0) AT TIME ZONE 'UTC'
 // catches long-idle wallets' leftover tails.
 export const PRUNE_RAW_SQL = `
 DELETE FROM fill WHERE tid IN (SELECT tid FROM fill WHERE time < to_timestamp($1 / 1000.0) LIMIT $2)`;
+
+// ── sync queue (migration 0006) ──────────────────────────────────────────────
+// $1 addresses (text[]). Discover's flush: every address just seen in the
+// trades WebSocket is marked due for CLAIM_SYNC_BATCH_SQL. last_trade_seen_at
+// means "dirty since" — it's stamped only when the wallet isn't already
+// waiting, so a wallet that trades every minute keeps its place in the FIFO
+// instead of being pushed to the back on each trade (~180 distinct wallets
+// trade per minute vs ~30 syncs/min of budget, measured 2026-10-05, so the
+// dirty set is usually bigger than one tick). `inserted` (xmax = 0) is true
+// only for rows this statement created, so callers can still count new wallets.
+export const UPSERT_WALLETS_SQL = `
+INSERT INTO wallet (address, last_trade_seen_at) SELECT unnest($1::text[]), now()
+ON CONFLICT (address) DO UPDATE SET last_trade_seen_at = now()
+  WHERE wallet.last_trade_seen_at IS NULL
+     OR wallet.last_trade_seen_at <= COALESCE(wallet.last_synced_at, '-infinity')
+RETURNING (xmax = 0) AS inserted`;
+
+// $1 limit · $2 lease ms. Claim + lease a batch (FOR UPDATE SKIP LOCKED, so
+// concurrent claimers get disjoint sets). Order: wallets that traded since we
+// last synced them first, oldest trade first (FIFO, so a busy minute can't
+// starve anyone); then everyone else by when we last looked. last_synced_at is
+// stamped at CLAIM time, before the fetch, so a trade landing mid-pass leaves
+// the wallet dirty for the next tick instead of being cleared by this one.
+// (The old `tier='hot'` lead key is gone — nothing ever assigned 'hot'.)
+export const CLAIM_SYNC_BATCH_SQL = `
+WITH due AS (
+  SELECT address FROM wallet
+  WHERE (claimed_until IS NULL OR claimed_until <= now())
+    AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+  ORDER BY COALESCE(last_trade_seen_at > COALESCE(last_synced_at, '-infinity'), false) DESC,
+           CASE WHEN last_trade_seen_at > COALESCE(last_synced_at, '-infinity') THEN last_trade_seen_at END ASC,
+           last_synced_at ASC NULLS FIRST
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE wallet SET claimed_until = now() + ($2 || ' milliseconds')::interval, last_synced_at = now()
+FROM due WHERE wallet.address = due.address
+RETURNING wallet.address, wallet.last_indexed_at`;
+
+// $1 address · $2 error message. Sync failed: bump fail_count, release the
+// claim, and clear last_synced_at — the claim stamped it, and leaving it would
+// silently drop a just-traded wallet out of the dirty set. NULL puts it at the
+// front again, gated by the backoff the caller writes to next_attempt_at.
+export const RECORD_SYNC_FAILURE_SQL = `
+UPDATE wallet SET fail_count = fail_count + 1, last_error = $2, claimed_until = NULL, last_synced_at = NULL
+WHERE address = $1 RETURNING fail_count`;

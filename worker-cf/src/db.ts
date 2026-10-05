@@ -14,6 +14,7 @@ import { neon } from "@neondatabase/serverless";
 import { nextAttemptDelay, type IngestDb, type IngestBatch, type SyncTarget } from "../../src/lib/wallets/ingest";
 import {
   INGEST_FILLS_SQL, TRIM_RAW_FILLS_SQL, RECOMPUTE_METRICS_SQL, PRUNE_DAILY_SQL, PRUNE_RAW_SQL,
+  UPSERT_WALLETS_SQL, CLAIM_SYNC_BATCH_SQL, RECORD_SYNC_FAILURE_SQL,
 } from "../../src/lib/wallets/sql";
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -32,32 +33,15 @@ export function makeDb(url: string): IngestDb {
     async upsertWallets(addresses: string[]): Promise<number> {
       if (!addresses.length) return 0;
       const uniq = [...new Set(addresses.map((a) => a.toLowerCase()))];
-      const r = await rows(
-        `INSERT INTO wallet (address) SELECT unnest($1::text[])
-         ON CONFLICT (address) DO NOTHING RETURNING address`,
-        [uniq],
-      );
-      return r.length;
+      const r = await rows<{ inserted: boolean }>(UPSERT_WALLETS_SQL, [uniq]);
+      return r.filter((x) => x.inserted).length;
     },
 
     // ── sync ──────────────────────────────────────────────────────────────
     // Atomically claim + lease due wallets — see worker/src/db.ts's claimSyncBatch
-    // for the multi-instance-safety rationale (identical SQL, HTTP transport).
+    // for the multi-instance-safety rationale (shared SQL, src/lib/wallets/sql.ts).
     async claimSyncBatch(limit: number, leaseMs: number): Promise<SyncTarget[]> {
-      return rows<SyncTarget>(
-        `WITH due AS (
-           SELECT address FROM wallet
-           WHERE (claimed_until IS NULL OR claimed_until <= now())
-             AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-           ORDER BY (tier='hot') DESC, last_indexed_at ASC NULLS FIRST
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE wallet SET claimed_until = now() + ($2 || ' milliseconds')::interval
-         FROM due WHERE wallet.address = due.address
-         RETURNING wallet.address, wallet.last_indexed_at`,
-        [limit, leaseMs],
-      );
+      return rows<SyncTarget>(CLAIM_SYNC_BATCH_SQL, [limit, leaseMs]);
     },
 
     // Same single statement as worker/src/db.ts (src/lib/wallets/sql.ts).
@@ -80,11 +64,7 @@ export function makeDb(url: string): IngestDb {
     },
 
     async recordSyncFailure(address: string, message: string): Promise<void> {
-      const r = await rows<{ fail_count: number }>(
-        `UPDATE wallet SET fail_count = fail_count + 1, last_error = $2, claimed_until = NULL
-         WHERE address = $1 RETURNING fail_count`,
-        [address, message.slice(0, 500)],
-      );
+      const r = await rows<{ fail_count: number }>(RECORD_SYNC_FAILURE_SQL, [address, message.slice(0, 500)]);
       const failCount = r[0]?.fail_count ?? 1;
       await rows(
         `UPDATE wallet SET next_attempt_at = $2 WHERE address = $1`,
