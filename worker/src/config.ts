@@ -27,7 +27,9 @@ export const config = {
   discoverFlushMs: num("DISCOVER_FLUSH_MS", 30_000),
 
   // Sync — the budget-dominating loop. At ~25 wt/userFills and a 1000-wt working
-  // limit, the ceiling is ~40 wallet refreshes/min. 15 wallets / 30 s = 30/min,
+  // limit, the ceiling is ~40 wallet refreshes/min of quiet wallets; a wallet
+  // returning thousands of fills costs more (20 + 1 per 20 fills), which the
+  // hl budget books after each response and waits off. 15 wallets / 30 s = 30/min,
   // the same throughput as the 2-minute beat, but a just-traded wallet (claimed
   // first since migration 0006) waits one 30 s tick instead of up to two minutes.
   syncIntervalMs: num("SYNC_INTERVAL_MS", 30_000),

@@ -15,23 +15,54 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const IS_WORKERD = typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
 
 // ---- Shared weight budget (the token bucket, in-process) -----------------
+// Hyperliquid has no rate-limit headers, so we account for weight ourselves.
+// Two things make that harder than a flat per-call cost (both seen in prod
+// 2026-10-05: six HL 429s right after a 44,697-fill sync tick):
+//  · userFillsByTime costs 20 PLUS 1 per 20 fills returned — a full 2000-fill
+//    page is ~120, not 25 — and the size is only known after the response.
+//    So the call reserves the worst case up front (concurrent in-flight pages
+//    can't overshoot) and `charge` refunds the unused part once it's in. Any
+//    debt past the limit carries into the next window(s) and is waited off.
+//  · A 429 means the real window is spent (our count drifted, or another
+//    caller on this IP). `exhaust` makes the retry wait for a fresh window
+//    instead of hammering it again within a second.
 const WEIGHT_LIMIT = 1000; // hold margin under the documented 1200/min/IP
+const WINDOW_MS = 60_000;
 let windowStart = Date.now();
 let spent = 0;
 
+// Advance to the current window, paying down WEIGHT_LIMIT of debt per window passed.
+function roll(now: number): void {
+  const windows = Math.floor((now - windowStart) / WINDOW_MS);
+  if (windows > 0) {
+    windowStart += windows * WINDOW_MS;
+    spent = Math.max(0, spent - windows * WEIGHT_LIMIT);
+  }
+}
+
 async function spend(weight: number): Promise<void> {
-  const now = Date.now();
-  if (now - windowStart >= 60_000) {
-    windowStart = now;
-    spent = 0;
+  for (;;) {
+    roll(Date.now());
+    if (spent + weight <= WEIGHT_LIMIT) {
+      spent += weight;
+      return;
+    }
+    // Re-check after waking: concurrent waiters share the same window, and the
+    // first one through may have used up what the window freed.
+    await new Promise((r) => setTimeout(r, Math.max(1, windowStart + WINDOW_MS - Date.now())));
   }
-  if (spent + weight > WEIGHT_LIMIT) {
-    const wait = Math.max(0, 60_000 - (now - windowStart));
-    await new Promise((r) => setTimeout(r, wait));
-    windowStart = Date.now();
-    spent = 0;
-  }
-  spent += weight;
+}
+
+// Adjust the books after a response: positive books extra cost, negative
+// refunds an over-reservation.
+function charge(weight: number): void {
+  roll(Date.now());
+  spent = Math.max(0, spent + weight);
+}
+
+function exhaust(): void {
+  roll(Date.now());
+  spent = Math.max(spent, WEIGHT_LIMIT);
 }
 
 // Thrown for a non-2xx HTTP response, carrying the status so callers (and the
@@ -55,7 +86,9 @@ function isRetryable(err: unknown): boolean {
   return true;
 }
 
-async function postInfo<T>(body: object, weight: number, attempt = 0): Promise<T> {
+// `extraWeight` adjusts a call's booked cost once the response is in — e.g. a
+// refund when it came back smaller than the reservation (see `charge`).
+async function postInfo<T>(body: object, weight: number, extraWeight?: (data: T) => number, attempt = 0): Promise<T> {
   await spend(weight);
   try {
     const init: RequestInit = {
@@ -66,13 +99,16 @@ async function postInfo<T>(body: object, weight: number, attempt = 0): Promise<T
     if (!IS_WORKERD) (init as { cache?: string }).cache = "no-store";
     const res = await fetch(INFO_URL, init);
     if (!res.ok) throw new HlHttpError(res.status, `HL ${res.status}`);
-    return (await res.json()) as T;
+    const data = (await res.json()) as T;
+    if (extraWeight) charge(extraWeight(data));
+    return data;
   } catch (err) {
+    if (err instanceof HlHttpError && err.status === 429) exhaust();
     if (attempt < 3 && isRetryable(err)) {
       const backoff = 250 * 2 ** attempt; // 250 / 500 / 1000ms
       const jittered = backoff * (0.5 + Math.random() * 0.5);
       await new Promise((r) => setTimeout(r, jittered));
-      return postInfo<T>(body, weight, attempt + 1);
+      return postInfo<T>(body, weight, extraWeight, attempt + 1);
     }
     throw err;
   }
@@ -118,7 +154,7 @@ export async function perpDexs(): Promise<PerpDex[]> {
 // ---- Wallet endpoints (Stage 2 · used by the worker indexer + M1b profiles) --
 // These stay in the REST-only gateway so both the always-on worker and the Next
 // wallet-profile pages share ONE token bucket. The worker polls userFillsByTime
-// (heavy, ≈25 wt — the leaderboard's whole cost); profile pages read the cheap
+// (heavy, 20 wt + 1 per 20 fills — the leaderboard's whole cost); profile pages read the cheap
 // live clearinghouseState (wt 2) for CURRENT positions, per the split rule.
 
 // One historical fill. `tid` is HL's globally-unique trade id → the fill PK.
@@ -141,9 +177,13 @@ export type Fill = {
 };
 
 // userFillsByTime — the indexer's sync call. Bounded window per request; the
-// worker walks it forward from each wallet's last_indexed watermark. Weight ≈25,
-// so this is the budget-dominating call (IMPLEMENTATION.md §5.4). aggregateByTime
+// worker walks it forward from each wallet's last_indexed watermark. Weight 20
+// plus 1 per 20 fills returned (up to ~120 for a full 2000-fill page), so this
+// is the budget-dominating call (IMPLEMENTATION.md §5.4). aggregateByTime
 // keeps partial fills of one order collapsed.
+const FILLS_PAGE_CAP = 2000;
+const fillsWeight = (n: number) => 20 + Math.floor(n / 20);
+const FILLS_PAGE_MAX_WEIGHT = fillsWeight(FILLS_PAGE_CAP); // 120, reserved per page, refunded down
 export async function userFillsByTime(
   user: string,
   startTime: number,
@@ -151,7 +191,7 @@ export async function userFillsByTime(
 ): Promise<Fill[]> {
   const req: Record<string, unknown> = { type: "userFillsByTime", user, startTime, aggregateByTime: true };
   if (endTime != null) req.endTime = endTime;
-  return postInfo<Fill[]>(req, 25);
+  return postInfo<Fill[]>(req, FILLS_PAGE_MAX_WEIGHT, (fills) => fillsWeight(fills.length) - FILLS_PAGE_MAX_WEIGHT);
 }
 
 // Paginate userFillsByTime forward through the 2000-fill depth cap, returning ALL
