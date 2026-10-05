@@ -119,44 +119,22 @@ ON CONFLICT (address) DO UPDATE SET last_trade_seen_at = now()
 RETURNING (xmax = 0) AS inserted`;
 
 // $1 limit · $2 lease ms. Claim + lease a batch (FOR UPDATE SKIP LOCKED, so
-// concurrent claimers get disjoint sets). Wallets that traded since we last
-// synced them ("dirty") go first, in priority classes, then everyone else by
-// when we last looked. last_synced_at is stamped at CLAIM time, before the
-// fetch, so a trade landing mid-pass leaves the wallet dirty for the next tick
-// instead of being cleared by this one.
-//
-// Why classes: more distinct wallets trade per hour (~3,450, measured
-// 2026-10-05) than the 1000 wt/min budget can sync (every userFillsByTime
-// call costs ≥20 wt, so ≤50 wallets/min even with no backlog), so the dirty
-// set only grows and a plain FIFO left every wallet waiting hours. Dirty
-// wallets are served in this order, FIFO (oldest trade first) within each:
-//   0. on a leaderboard (top 500 of P&L, activity, or qualifying win rate) —
-//      what /wallets and its profiles show
-//   1. never indexed — new wallets; nothing about them is known until synced
-//   2. fresh (<30d, the /fresh feed)
-//   3. everyone else
-// A wallet re-dirtied by trading again goes to the back of its class, so a
-// constant trader can't hold the front.
+// concurrent claimers get disjoint sets). Order: wallets that traded since we
+// last synced them first, oldest trade first (FIFO, so a busy minute can't
+// starve anyone); then everyone else by when we last looked. last_synced_at is
+// stamped at CLAIM time, before the fetch, so a trade landing mid-pass leaves
+// the wallet dirty for the next tick instead of being cleared by this one.
+// (The old `tier='hot'` lead key is gone — nothing ever assigned 'hot'.)
 export const CLAIM_SYNC_BATCH_SQL = `
-WITH lb AS (
-  (SELECT address FROM wallet_metrics ORDER BY realized_pnl DESC LIMIT 500)
-  UNION (SELECT address FROM wallet_metrics ORDER BY trade_count DESC LIMIT 500)
-  UNION (SELECT address FROM wallet_metrics WHERE qualifies_winrate ORDER BY win_rate DESC LIMIT 500)
-), due AS (
-  SELECT w.address FROM wallet w
-  WHERE (w.claimed_until IS NULL OR w.claimed_until <= now())
-    AND (w.next_attempt_at IS NULL OR w.next_attempt_at <= now())
-  ORDER BY CASE
-             WHEN NOT COALESCE(w.last_trade_seen_at > COALESCE(w.last_synced_at, '-infinity'), false) THEN 4
-             WHEN w.address IN (SELECT address FROM lb) THEN 0
-             WHEN w.last_indexed_at IS NULL THEN 1
-             WHEN w.is_fresh THEN 2
-             ELSE 3
-           END,
-           CASE WHEN w.last_trade_seen_at > COALESCE(w.last_synced_at, '-infinity') THEN w.last_trade_seen_at END ASC,
-           w.last_synced_at ASC NULLS FIRST
+WITH due AS (
+  SELECT address FROM wallet
+  WHERE (claimed_until IS NULL OR claimed_until <= now())
+    AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+  ORDER BY COALESCE(last_trade_seen_at > COALESCE(last_synced_at, '-infinity'), false) DESC,
+           CASE WHEN last_trade_seen_at > COALESCE(last_synced_at, '-infinity') THEN last_trade_seen_at END ASC,
+           last_synced_at ASC NULLS FIRST
   LIMIT $1
-  FOR UPDATE OF w SKIP LOCKED
+  FOR UPDATE SKIP LOCKED
 )
 UPDATE wallet SET claimed_until = now() + ($2 || ' milliseconds')::interval, last_synced_at = now()
 FROM due WHERE wallet.address = due.address
